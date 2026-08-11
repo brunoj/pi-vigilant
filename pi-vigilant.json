@@ -1,0 +1,9 @@
+{
+  "comment": "pi-vigilant extension configuration. Reload (/reload) to apply changes.",
+  "prematureStopDetection": true,
+  "lengthStopContinuation": true,
+  "compactionContinuation": true,
+  "finalVerification": true,
+  "feedbackMemoryIntegration": true,
+  "specMemoryIntegration": true
+}
