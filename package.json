@@ -22,13 +22,11 @@
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
-    "PLAN.md",
-    "SPEC-MEMORY-PLAN.md",
     "skills/"
   ],
   "scripts": {
     "clean": "echo 'nothing to clean'",
-    "build": "echo 'nothing to build — pi loads .ts via jiti at runtime'",
+    "build": "echo 'nothing to build \u2014 pi loads .ts via jiti at runtime'",
     "check": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck --allowImportingTsExtensions --noCheck index.ts",
     "test": "echo 'see https://github.com/brunoj/pi-vigilant for test suites'",
     "release": "./scripts/release.sh"

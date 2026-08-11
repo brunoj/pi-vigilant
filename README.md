@@ -79,7 +79,7 @@ npm run check      # tsc --noEmit
 npm run release    # bump version + changelog + tag + publish (see below)
 ```
 
-Test suites used during development live in the repo history; see `PLAN.md` and `SPEC-MEMORY-PLAN.md` for the design and the 11-scenario test matrix.
+Test suites used during development live in the repo history (see the 0.1.0-era commits for the 11-scenario test matrix and design notes).
 
 ### Releasing (auto-versioning)
 
