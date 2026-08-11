@@ -8,13 +8,13 @@
   "type": "module",
   "license": "MIT",
   "author": "Bruno Jakic <bruno@ai-applied.nl>",
-  "homepage": "https://github.com/AiAppliedNL/pi-vigilant#readme",
+  "homepage": "https://github.com/brunoj/pi-vigilant#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AiAppliedNL/pi-vigilant.git"
+    "url": "git+https://github.com/brunoj/pi-vigilant.git"
   },
   "bugs": {
-    "url": "https://github.com/AiAppliedNL/pi-vigilant/issues"
+    "url": "https://github.com/brunoj/pi-vigilant/issues"
   },
   "files": [
     "index.ts",
@@ -30,7 +30,7 @@
     "clean": "echo 'nothing to clean'",
     "build": "echo 'nothing to build — pi loads .ts via jiti at runtime'",
     "check": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck --allowImportingTsExtensions --noCheck index.ts",
-    "test": "echo 'see https://github.com/AiAppliedNL/pi-vigilant for test suites'",
+    "test": "echo 'see https://github.com/brunoj/pi-vigilant for test suites'",
     "release": "./scripts/release.sh"
   },
   "pi": {

@@ -24,7 +24,7 @@ pi install npm:pi-vigilant
 Or from git:
 
 ```bash
-pi install git:github.com/AiAppliedNL/pi-vigilant
+pi install git:github.com/brunoj/pi-vigilant
 ```
 
 Or locally during development:
