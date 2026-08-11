@@ -38,7 +38,8 @@ if (!cl.includes(`## [${vv}]`)) {
 }
 EOF
 
-git add package.json package-lock.json CHANGELOG.md
+git add package.json CHANGELOG.md
+[ -f package-lock.json ] && git add package-lock.json
 git commit -m "chore: release $NEW_VERSION"
 git tag "$NEW_VERSION"
 
