@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.1] - 2026-08-11
 
-### Added
+### Changed
 
-- (describe changes for 0.1.1)
+- Removed internal planning docs (`PLAN.md`, `SPEC-MEMORY-PLAN.md`) from the repository and the npm package — the tarball now ships only runtime files and skills.
 
 
 ## [0.1.0] - 2026-08-11
