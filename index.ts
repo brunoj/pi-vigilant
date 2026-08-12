@@ -328,19 +328,24 @@ function compileFeedback(
   const allItems = [...projectItems, ...globalItems];
   if (allItems.length === 0) return "";
 
-  // Group by category, keep only the most recent per category
+  // Group by scope+category, keeping only the most recent per group.
+  // Scope is part of the key so a global item can never mask a
+  // project-specific item in the same category (they address different
+  // things and both must be checked).
   const byCategory = new Map<string, FeedbackItem>();
   for (const item of allItems) {
-    const existing = byCategory.get(item.category);
+    const key = `${item.scope === "project" ? "project" : "global"}:${item.category}`;
+    const existing = byCategory.get(key);
     if (!existing || item.timestamp > existing.timestamp) {
-      byCategory.set(item.category, item);
+      byCategory.set(key, item);
     }
   }
 
   // Sort categories: project items first, then global; within each, by recency
   const projectCats = new Map<string, FeedbackItem>();
   const globalCats = new Map<string, FeedbackItem>();
-  for (const [cat, item] of byCategory) {
+  for (const [key, item] of byCategory) {
+    const cat = key.slice(key.indexOf(":") + 1);
     if (item.scope === "project") projectCats.set(cat, item);
     else globalCats.set(cat, item);
   }
@@ -1327,6 +1332,13 @@ export default function (pi: ExtensionAPI): void {
     if (event.source === "extension") return;
     state.taskToolCallCount = 0;
 
+    // A genuine user message starts a NEW task, so the previous task's
+    // verification must not suppress this one. Without this reset the
+    // 15-minute cooldown is session-wide and only the first task of a
+    // session ever gets verified.
+    state.lastVerificationTime = 0;
+    state.continuationSinceLastVerification = false;
+
     // ── Spec-memory task rotation ─────────────────────────────────────
     // Rotate to a fresh task if: verification already ran (verificationSentAt set)
     // AND no MUST spec is open/in-progress. User refines after verification → new task.
@@ -1612,16 +1624,38 @@ export default function (pi: ExtensionAPI): void {
       timeSinceLastVerification >= VERIFICATION_COOLDOWN_MS;
     const hadContinuation = state.continuationSinceLastVerification;
 
-    // Send if: never sent, OR a continuation fired since last check, OR 15+ min elapsed
-    if (!neverSent && !hadContinuation && !cooldownExpired) return;
+    // Specs left "open"/"in-progress" mean a previous verification checklist
+    // was never acted on. That must never be silenced by the cooldown.
+    let pendingSpecs = false;
+    if (config.specMemoryIntegration) {
+      const pendingTask = loadSpecTask(getCurrentTaskFile());
+      if (pendingTask) {
+        pendingSpecs = Object.values(pendingTask.areas)
+          .flat()
+          .some((s) => s.status === "open" || s.status === "in-progress");
+      }
+    }
+
+    // Send if: never sent, OR a continuation fired since last check,
+    // OR 15+ min elapsed, OR specs are still awaiting a verdict.
+    if (!neverSent && !hadContinuation && !cooldownExpired && !pendingSpecs)
+      return;
 
     state.lastVerificationTime = now;
     state.continuationSinceLastVerification = false;
 
-    // Build the verification prompt — task specifications first, then
-    // feedback checkpoints (if available).
+    // Build the verification prompt. The base instruction is intentionally
+    // specific: verify that captured specs and feedback were actually
+    // implemented/addressed as requested — not a vague "are you done" check.
+    // Concrete specifics (the real spec tree, the real feedback checkpoints)
+    // are appended below whenever they exist, so the agent verifies against
+    // actual requirements instead of its own memory of the conversation.
     let prompt =
-      "Have you finished everything you were asked to do? If so, state this clearly with full responsibility, re-iterating the completed tasks. If not, continue until all the tasks are finished!";
+      "Verify that everything you were asked to do has actually been implemented as requested — " +
+      "not just attempted or assumed. Check the captured task specifications and past feedback " +
+      "checkpoints below (if any) against the real deliverable. If everything is verified complete, " +
+      "state this clearly with full responsibility, re-iterating what was verified. If anything is " +
+      "missing, unmet, or unaddressed, continue working until it is.";
 
     // Spec-memory verification checklist
     if (config.specMemoryIntegration) {
@@ -1630,18 +1664,39 @@ export default function (pi: ExtensionAPI): void {
       if (task && Object.keys(task.areas).length > 0) {
         const specs = formatSpecTree(task);
         if (specs) {
+          // Are there specs the agent still has to rule on? Specs left
+          // "open"/"in-progress" mean the previous verification prompt was
+          // never acted on, so this verification must not be suppressed.
+          const allSpecs = Object.values(task.areas).flat();
+          const unresolvedMust = allSpecs.filter(
+            (s) =>
+              s.priority === "must" &&
+              (s.status === "open" || s.status === "in-progress"),
+          ).length;
+
           prompt +=
             "\n\n" +
             specs +
-            "\nVerify EACH specification against the actual deliverable: " +
-            "call update_spec_status for every spec with concrete evidence " +
-            "(test output, build result, code inspection, or ask the user when " +
-            "you cannot verify objectively). If any MUST spec is not met, " +
-            "continue working until it is. SHOULD specs: note briefly. " +
-            "Only declare the task complete when every MUST spec is met or " +
-            "explicitly obsolete.";
+            "\nVerify EACH specification above was actually implemented as requested, against the " +
+            "real deliverable (not from memory): call update_spec_status for every spec with concrete " +
+            "evidence (test output, build result, code inspection, or ask the user when you cannot " +
+            "verify objectively). If any MUST spec is not met, continue working until it is. " +
+            "SHOULD specs: note briefly. Only declare the task complete when every MUST spec is met " +
+            "or explicitly obsolete.";
 
-          // Record that verification ran for this task (drives rotation)
+          if (unresolvedMust > 0) {
+            prompt +=
+              `\n\n⚠️ ${unresolvedMust} MUST spec(s) still have status "open"/"in-progress". ` +
+              "Do NOT declare the task complete until you have called " +
+              "update_spec_status on each of them with real evidence.";
+          }
+
+          // Record that verification ran for this task (drives rotation).
+          // Set unconditionally: rotation separately requires that no MUST
+          // spec is still open/in-progress, so unverified specs already block
+          // archiving. Gating this on resolution instead would deadlock —
+          // once specs are resolved the cooldown suppresses further
+          // verifications, so the flag would never be written at all.
           task.verificationSentAt = new Date().toISOString();
           saveSpecTask(currentFile, task);
         }
@@ -1653,9 +1708,10 @@ export default function (pi: ExtensionAPI): void {
       : "";
     if (checkpoints) {
       prompt +=
-        "\n\nBefore you answer, check each of these specific issues from past user feedback:\n" +
+        "\n\nVerify each of these past feedback issues has actually been addressed in this session's work " +
+        "(not just noted) — check the specific behavior against what you actually did:\n" +
         checkpoints +
-        "\nAddress each checkpoint explicitly before proceeding.";
+        "\nAddress each checkpoint explicitly, with concrete evidence, before declaring the task complete.";
     }
 
     try {
