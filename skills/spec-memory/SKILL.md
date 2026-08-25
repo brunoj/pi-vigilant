@@ -38,6 +38,29 @@ This skill is for **hard specifications** — requirements, constraints, accepta
 - **Specs from other projects/sessions**: only capture specs stated in the current session for the current task
 - **Task instruction**: "build me a REST API" — that's the task; the *requirements* within it are specs
 
+### External planning docs — treat them like own captured specs
+
+When a task references or contains **external planning documents** —
+IMPROVEMENT-PLAN.md, PLAN.md, requirements docs, delivery logs, ticket/issue
+lists — **realize they exist** (actively look for them: repo root, `docs/`,
+anything the user points at) and **ingest their actionable items as specs**:
+
+- Each actionable item becomes its own `capture_spec` with `sourceQuote`
+  pointing at the doc + item id (e.g. `IMPROVEMENT-PLAN.md IMP-002`).
+- **The doc's own ✅ / "delivered" markers are claims, not evidence.** A
+  delivery log saying "IMP-006 delivered ✅" proves nothing — the item must be
+  traced to code and verified like any other spec.
+- This is the single biggest shortcut trap: an external plan's checkmarks get
+  trusted as ground truth and the actual code is never checked.
+
+```tool
+capture_spec
+  requirement: "Service agent titles/descriptions/priority/difficulty are set by intelligenceBudget.analyze() and rendered on the card"
+  area: "functionality"
+  priority: "must"
+  sourceQuote: "IMPROVEMENT-PLAN.md IMP-002/006 (delivery log claims ✅ — must be traced to code)"
+```
+
 ### The litmus test
 
 Ask yourself: **"Will the user check the deliverable against this statement? Can I objectively verify it?"**
@@ -195,5 +218,7 @@ Auto-continue injects specs at two points:
 - **Don't capture vague preferences** — "make it nice" → either reject or capture with concrete interpretation.
 - **Don't capture behavior criticism** — that's `capture_feedback`, not here.
 - **Don't invent specs** — only capture what the user explicitly states.
+- **Don't trust an external plan's checkmarks** — a delivery log's ✅ is a claim,
+  not evidence; ingest the item as a spec and verify it against code.
 - **Don't self-certify unverifiable specs** — ask the user.
 - **Don't use keyword matching** — use judgment. The user won't always say "specification."

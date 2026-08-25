@@ -112,6 +112,17 @@ function loadConfig(): ExtensionConfig {
 // Spec-Memory — types and helpers
 // ---------------------------------------------------------------------------
 
+interface Trace {
+  /** Operator-facing observable outcome this spec delivers (e.g. "ingested report has an agent_title on the card"). */
+  outcome: string;
+  /** Concrete code path that delivers it (e.g. "ingest → analyze() → persist → render"). */
+  codePath: string;
+  /** Test file that asserts the outcome (optional — required for feature/behavior specs). */
+  testFile?: string;
+  /** Assertion string that must appear in testFile. */
+  assertion?: string;
+}
+
 interface SpecItem {
   id: string;
   requirement: string;
@@ -123,6 +134,8 @@ interface SpecItem {
   supersedes?: string[];
   evidence?: string;
   verifiedAt?: string;
+  /** Spec-to-code traceability (M1): how this spec's outcome is delivered and tested. */
+  trace?: Trace;
 }
 
 interface SpecTask {
@@ -228,6 +241,15 @@ function formatSpecTree(task: SpecTask): string {
       lines.push(`  [${spec.priority}][${status}]  ${spec.id}: ${spec.requirement}`);
       if (spec.parentId) {
         lines.push(`    → Sub-spec: ${spec.requirement}`);
+      }
+      if (spec.trace) {
+        lines.push(`    → trace: ${spec.trace.outcome}`);
+        lines.push(`      code path: ${spec.trace.codePath}`);
+        if (spec.trace.testFile) {
+          lines.push(
+            `      test: ${spec.trace.testFile}${spec.trace.assertion ? ` (asserts "${spec.trace.assertion}")` : ""}`,
+          );
+        }
       }
     }
   }
@@ -907,6 +929,7 @@ export default function (pi: ExtensionAPI): void {
       "Use parentId to decompose broad specs into sub-specs.",
       "Use supersedes when the user changes a requirement (mark old spec as obsolete).",
       "Be specific and checkable: 'API must return 401' is good; 'make it secure' is bad.",
+      "EXTERNAL PLANNING DOCS: when a task references or contains external planning documents (IMPROVEMENT-PLAN.md, PLAN.md, requirements docs, delivery logs, ticket lists), ingest every actionable item as its own spec with sourceQuote pointing at the doc + item id. The doc's own ✅/delivered markers are claims, not evidence — each item gets traced and verified like any other spec.",
     ],
     parameters: Type.Object({
       requirement: Type.String({
@@ -943,6 +966,29 @@ export default function (pi: ExtensionAPI): void {
           }),
         ),
       ),
+      trace: Type.Optional(
+        Type.Object({
+          outcome: Type.String({
+            description:
+              "Operator-facing observable outcome this spec delivers (e.g. \"ingested report has an agent_title on the card\").",
+          }),
+          codePath: Type.String({
+            description:
+              "Concrete code path that delivers it (e.g. \"ingest → analyze() → persist → render\").",
+          }),
+          testFile: Type.Optional(
+            Type.String({
+              description:
+                "Test file that asserts the outcome (required for feature/behavior specs).",
+            }),
+          ),
+          assertion: Type.Optional(
+            Type.String({
+              description: "Assertion string that must appear in testFile.",
+            }),
+          ),
+        }),
+      ),
     }),
     async execute(
       _toolCallId: string,
@@ -953,6 +999,7 @@ export default function (pi: ExtensionAPI): void {
         parentId?: string;
         sourceQuote?: string;
         supersedes?: string[];
+        trace?: Trace;
       },
       _signal: AbortSignal,
       _onUpdate:
@@ -1025,6 +1072,7 @@ export default function (pi: ExtensionAPI): void {
         supersedes: params.supersedes,
         evidence: undefined,
         verifiedAt: undefined,
+        trace: params.trace,
       };
 
       // Add to area
@@ -1147,6 +1195,29 @@ export default function (pi: ExtensionAPI): void {
             "Optional note (e.g., 'needs user confirmation for unverifiable spec')",
         }),
       ),
+      trace: Type.Optional(
+        Type.Object({
+          outcome: Type.String({
+            description:
+              "Operator-facing observable outcome this spec delivers (e.g. \"ingested report has an agent_title on the card\").",
+          }),
+          codePath: Type.String({
+            description:
+              "Concrete code path that delivers it (e.g. \"ingest → analyze() → persist → render\").",
+          }),
+          testFile: Type.Optional(
+            Type.String({
+              description:
+                "Test file that asserts the outcome (required for feature/behavior specs).",
+            }),
+          ),
+          assertion: Type.Optional(
+            Type.String({
+              description: "Assertion string that must appear in testFile.",
+            }),
+          ),
+        }),
+      ),
     }),
     async execute(
       _toolCallId: string,
@@ -1155,6 +1226,7 @@ export default function (pi: ExtensionAPI): void {
         status: "met" | "not-met" | "partial" | "in-progress" | "obsolete";
         evidence?: string;
         note?: string;
+        trace?: Trace;
       },
       _signal: AbortSignal,
       _onUpdate:
@@ -1203,6 +1275,9 @@ export default function (pi: ExtensionAPI): void {
           spec.status = params.status;
           if (params.evidence) {
             spec.evidence = params.evidence;
+          }
+          if (params.trace) {
+            spec.trace = params.trace;
           }
           spec.verifiedAt = new Date().toISOString();
           found = true;
