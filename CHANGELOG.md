@@ -11,7 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- (describe changes for 0.1.3)
+- **Spec-to-code traceability (`trace` field)** — every spec can now carry a
+  trace `{ outcome, codePath, testFile, assertion }`: the operator-facing
+  outcome it delivers, the concrete code path that delivers it, and the test
+  that asserts it. `capture_spec` and `update_spec_status` accept it;
+  `get_task_specs` renders it. Backward compatible (optional field). This is
+  the M1 mechanism from the verification-integrity plan, consumed by
+  pi-aia-asf's `/asf verify` mechanical gate (0.3.0).
+- **External planning doc ingestion (M6)** — `capture_spec` prompt guidelines
+  and the spec-memory skill now instruct the agent to ingest actionable items
+  from external planning documents (IMPROVEMENT-PLAN.md, PLAN.md, delivery
+  logs, ticket lists) as their own specs with `sourceQuote` pointing at the
+  doc. The doc's own ✅/delivered markers are treated as claims, not evidence
+  — each item is traced and verified like any other spec (the Betamaxx
+  delivery-log trap).
 
 
 ## [0.1.2] - 2026-08-12
