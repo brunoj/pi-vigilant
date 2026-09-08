@@ -5,5 +5,10 @@
   "compactionContinuation": true,
   "finalVerification": true,
   "feedbackMemoryIntegration": true,
-  "specMemoryIntegration": true
+  "specMemoryIntegration": true,
+
+  "staleContinuationComment": "Continuations queued while the provider was unreachable become permanent context messages. These three settings bound how many are queued and drop the ones whose interruption is over.",
+  "staleContinuationFiltering": true,
+  "maxConsecutiveFailureContinuations": 3,
+  "hostRetryBudget": 3
 }

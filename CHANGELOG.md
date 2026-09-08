@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-08
+
+### Fixed
+
+- **Stale-continuation bug** — when connectivity drops, every failed turn
+  queued a continuation. Each one was drained into the session, persisted, and
+  converted to a `user`-role message, so after recovery the model saw N standing
+  instructions to resume work that was already finished. Three cooperating
+  mechanisms now bound and expire them:
+
+  1. **Host-retry deferral (L1)** — Pi already retries retryable errors with
+     backoff, so the extension stays out of the way for the first
+     `hostRetryBudget` (default 3) consecutive retryable failures. It defers
+     rather than suppresses: `isRetryableAssistantError` cannot distinguish
+     "host will retry" from "retries exhausted", so suppressing outright would
+     mean never resuming after the host gives up.
+  2. **Circuit breaker (L2)** — at most `maxConsecutiveFailureContinuations`
+     (default 3) continuations per unbroken failure streak, so a long outage
+     costs a constant number of messages instead of one per failed turn.
+  3. **Run-id + epoch stamping with a context filter (L3)** — every
+     continuation carries the run id and epoch it was queued in. A `context`
+     handler (fires before each LLM call) drops continuations that are stale:
+     queued by a previous process (different run id) or in a superseded epoch
+     (a later turn succeeded). The filter is scoped to the five
+     `auto-continue-*` customTypes, never touches other extensions' custom
+     messages, and keeps un-stamped messages from older versions.
+
+### Added
+
+- Config keys `staleContinuationFiltering`, `maxConsecutiveFailureContinuations`,
+  `hostRetryBudget` (all defaulted on, documented in `pi-vigilant.json`).
+- Durable test suite in `test/` (69 checks across regression, stale-mitigation,
+  and resume suites; `npm test` runs them; `test/setup.sh` prepares the jiti
+  harness against the installed pi).
+
+### Verification
+
+- 69/69 harness checks pass against the real `index.ts`.
+- Live A/B with a capturing provider proxy on an identical resumed session:
+  shipped 0.1.3 sent **36** stale "stopped due to an error" instructions to the
+  provider; 0.1.4 sent **0** (only the system prompt and the user's real
+  message).
+- Live outage: 16 failed turns produced 3 continuations instead of 16.
+
 ## [0.1.3] - 2026-08-25
 
 ### Added

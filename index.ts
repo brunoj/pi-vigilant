@@ -42,7 +42,10 @@ import type {
   AgentEndEvent,
   SessionCompactEvent,
 } from "@earendil-works/pi-coding-agent";
-import { isContextOverflow } from "@earendil-works/pi-ai/compat";
+import {
+  isContextOverflow,
+  isRetryableAssistantError,
+} from "@earendil-works/pi-ai/compat";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,6 +75,15 @@ interface ExtensionConfig {
   finalVerification: boolean;
   feedbackMemoryIntegration: boolean;
   specMemoryIntegration: boolean;
+  /** Drop continuations from a past epoch out of the LLM context (see epoch below). */
+  staleContinuationFiltering: boolean;
+  /** Hard cap on continuations queued during one unbroken failure streak. */
+  maxConsecutiveFailureContinuations: number;
+  /**
+   * Number of consecutive retryable failures to leave to Pi's own retry layer
+   * before stepping in. Should mirror the host's `retry.maxRetries` (default 3).
+   */
+  hostRetryBudget: number;
 }
 
 function loadConfig(): ExtensionConfig {
@@ -93,6 +105,16 @@ function loadConfig(): ExtensionConfig {
           parsed.feedbackMemoryIntegration !== false,
         specMemoryIntegration:
           parsed.specMemoryIntegration !== false,
+        staleContinuationFiltering:
+          parsed.staleContinuationFiltering !== false,
+        maxConsecutiveFailureContinuations: normalizeCount(
+          parsed.maxConsecutiveFailureContinuations,
+          DEFAULT_MAX_CONSECUTIVE_FAILURE_CONTINUATIONS,
+        ),
+        hostRetryBudget: normalizeCount(
+          parsed.hostRetryBudget,
+          DEFAULT_HOST_RETRY_BUDGET,
+        ),
       };
     }
   } catch {
@@ -105,7 +127,80 @@ function loadConfig(): ExtensionConfig {
     finalVerification: true,
     feedbackMemoryIntegration: true,
     specMemoryIntegration: true,
+    staleContinuationFiltering: true,
+    maxConsecutiveFailureContinuations:
+      DEFAULT_MAX_CONSECUTIVE_FAILURE_CONTINUATIONS,
+    hostRetryBudget: DEFAULT_HOST_RETRY_BUDGET,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Stale-continuation control
+//
+// When connectivity drops, every failed turn produces an `agent_end`. The
+// continuation this extension queues is drained by the agent loop, pushed into
+// `agent.state.messages`, persisted, and converted to a `user` role message for
+// the LLM. It therefore never expires on its own: once connectivity returns and
+// the work completes, N messages saying "you were interrupted, resume" are still
+// sitting in the context, instructing the model to continue finished work.
+//
+// Three cooperating mechanisms bound and expire them:
+//
+//   1. Host-retry deferral — Pi already retries retryable errors with backoff.
+//      Queuing our own continuation on top duplicates that. We stay out of the
+//      way for the first `hostRetryBudget` consecutive retryable failures.
+//      Note this must DEFER rather than SUPPRESS: `isRetryableAssistantError`
+//      answers "is this class of error retryable", not "will the host retry it
+//      again", so suppressing outright would mean never resuming once the host
+//      exhausts its budget.
+//
+//   2. Circuit breaker — at most `maxConsecutiveFailureContinuations`
+//      continuations per unbroken failure streak, so a long outage costs a
+//      constant number of messages instead of one per failed turn.
+//
+//   3. Epoch stamping — every continuation carries the epoch it was queued in.
+//      The first successful turn after a failure streak increments the epoch,
+//      which is precisely the moment those continuations stopped being true.
+//      A `context` handler then drops past-epoch continuations from the LLM
+//      context before each call.
+// ---------------------------------------------------------------------------
+
+/** Default cap on continuations queued during a single failure streak. */
+const DEFAULT_MAX_CONSECUTIVE_FAILURE_CONTINUATIONS = 3;
+
+/** Default assumed host retry budget (Pi's `retry.maxRetries` default is 3). */
+const DEFAULT_HOST_RETRY_BUDGET = 3;
+
+/**
+ * customTypes this extension queues. The context filter only ever considers
+ * these, so custom messages from other extensions are never touched.
+ */
+const CONTINUATION_CUSTOM_TYPES = new Set([
+  "auto-continue-abort",
+  "auto-continue-length",
+  "auto-continue-premature",
+  "auto-continue-error",
+  "auto-continue-compaction",
+]);
+
+/**
+ * Identifies the process that queued a continuation.
+ *
+ * The epoch counter lives in memory but continuations are persisted, so after
+ * `--continue`/`--session` the counter restarts at 0 while inherited
+ * continuations still carry the previous process's epochs — comparing the two
+ * is meaningless. The run id makes "queued by an earlier process" decidable:
+ * any continuation with a different run id was delivered and acted on before
+ * this process started, so whatever it interrupted is necessarily over.
+ */
+const RUN_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+/** Coerce a config value to a non-negative integer, falling back to a default. */
+function normalizeCount(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+  return Math.floor(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +582,18 @@ interface ContinuationState {
   lastVerificationTime: number;
   /** Whether any continuation (length/premature/compaction) fired since the last verification. */
   continuationSinceLastVerification: boolean;
+  /**
+   * Monotonic continuation epoch. Continuations are stamped with the epoch they
+   * were queued in; the first successful turn after a failure streak increments
+   * it, marking every earlier continuation as describing an interruption that is
+   * over. Never reset — it must keep rising for the whole session, otherwise a
+   * later epoch could collide with stamps already sitting in the context.
+   */
+  epoch: number;
+  /** Consecutive failed turns in the current streak (reset by any successful turn). */
+  consecutiveFailures: number;
+  /** Continuations queued during the current failure streak (bounded by config). */
+  failureContinuationsQueued: number;
   /** Number of tool calls in the last agent run (used to detect simple Q&A vs complex task). */
   lastRunToolCallCount: number;
   /** Tool calls since the last genuine user message (task boundary). */
@@ -617,6 +724,44 @@ type AssistantMessage = Extract<
   { role: "assistant" }
 >;
 
+/** Any message as it appears in the LLM context list. */
+type AgentMessage = AgentEndEvent["messages"][number];
+
+/**
+ * Is this one of our own continuations describing an interruption that is over?
+ *
+ * Two ways to be stale:
+ *   1. queued by an earlier process (different run id) — it was already
+ *      delivered and acted on before this session was resumed;
+ *   2. queued by this process in a superseded epoch — a later turn succeeded,
+ *      so the outage it describes has ended.
+ *
+ * Conservative by construction — anything not unambiguously a stale
+ * pi-vigilant continuation is kept:
+ *   - only `role: "custom"` messages are considered;
+ *   - only our five `auto-continue-*` customTypes, so other extensions' custom
+ *     messages are never touched;
+ *   - only messages carrying a numeric `epoch`, so continuations written by
+ *     versions before epoch stamping are never retroactively dropped.
+ */
+function isStaleContinuation(
+  message: AgentMessage,
+  currentEpoch: number,
+): boolean {
+  if (message.role !== "custom") return false;
+  if (!CONTINUATION_CUSTOM_TYPES.has(message.customType)) return false;
+
+  const details = message.details as
+    | { epoch?: unknown; runId?: unknown }
+    | undefined;
+
+  const epoch = details?.epoch;
+  if (typeof epoch !== "number" || !Number.isFinite(epoch)) return false;
+
+  if (details?.runId !== RUN_ID) return true; // inherited from a previous run
+  return epoch < currentEpoch;
+}
+
 function lastAssistantMessage(
   messages: AgentEndEvent["messages"],
 ): AssistantMessage | undefined {
@@ -640,6 +785,9 @@ export default function (pi: ExtensionAPI): void {
     lastResponseConclusive: true,
     lastVerificationTime: 0,
     continuationSinceLastVerification: false,
+    epoch: 0,
+    consecutiveFailures: 0,
+    failureContinuationsQueued: 0,
     lastRunToolCallCount: 0,
     taskToolCallCount: 0,
     sessionTotalToolCalls: 0,
@@ -1476,6 +1624,54 @@ export default function (pi: ExtensionAPI): void {
     }
   });
 
+  /**
+   * Record a failed turn and decide whether to queue a continuation for it.
+   *
+   * Returns false when the continuation should be skipped, either because Pi's
+   * own retry layer is still working on it or because this failure streak has
+   * already produced its budget of continuations.
+   *
+   * `assistant` is undefined when the provider produced no message at all.
+   */
+  function shouldQueueFailureContinuation(
+    assistant: AssistantMessage | undefined,
+  ): boolean {
+    state.consecutiveFailures++;
+
+    // Layer 1 — leave the first N retryable failures to Pi's retry machinery.
+    // Extensions don't receive `willRetry` on agent_end, so the host's budget is
+    // mirrored rather than observed: defer while within it, then step in.
+    const hostMayStillRetry =
+      assistant !== undefined &&
+      isRetryableAssistantError(assistant) &&
+      state.consecutiveFailures <= config.hostRetryBudget;
+    if (hostMayStillRetry) return false;
+
+    // Layer 2 — circuit breaker. Bound the cost of a long outage to a constant.
+    if (
+      state.failureContinuationsQueued >=
+      config.maxConsecutiveFailureContinuations
+    ) {
+      return false;
+    }
+
+    state.failureContinuationsQueued++;
+    return true;
+  }
+
+  /**
+   * A turn completed without failing. Close out any failure streak: bump the
+   * epoch so continuations queued during the outage are recognised as stale,
+   * and reset the streak counters.
+   */
+  function noteSuccessfulTurn(): void {
+    if (state.consecutiveFailures > 0) {
+      state.epoch++;
+    }
+    state.consecutiveFailures = 0;
+    state.failureContinuationsQueued = 0;
+  }
+
   // ── Single agent_end handler covering length + premature stops ───────
   pi.on("agent_end", (event: AgentEndEvent, ctx: ExtensionContext) => {
     const assistant = lastAssistantMessage(event.messages);
@@ -1486,6 +1682,7 @@ export default function (pi: ExtensionAPI): void {
     if (!assistant) {
       if (ctx.hasPendingMessages()) return;
       state.lastResponseConclusive = false;
+      if (!shouldQueueFailureContinuation(undefined)) return;
       state.continuationSinceLastVerification = true;
       try {
         pi.sendMessage(
@@ -1493,7 +1690,11 @@ export default function (pi: ExtensionAPI): void {
             customType: "auto-continue-abort",
             content: `Your previous response was interrupted before it could produce any output. This appears to be a transient provider issue. Please re-read the user's last message and respond again from scratch. Do not repeat completed work from earlier turns.`,
             display: false,
-            details: { kind: "provider_abort_continuation" },
+            details: {
+              kind: "provider_abort_continuation",
+              epoch: state.epoch,
+              runId: RUN_ID,
+            },
           },
           { triggerTurn: true, deliverAs: "followUp" },
         );
@@ -1501,6 +1702,13 @@ export default function (pi: ExtensionAPI): void {
         // Agent may be in a state that rejects messages
       }
       return;
+    }
+
+    // A turn that produced a message and did not error ends any failure streak
+    // and retires the continuations queued during it. Length/premature stops are
+    // incomplete responses, not failed calls, so they count as progress here.
+    if (assistant.stopReason !== "error") {
+      noteSuccessfulTurn();
     }
 
     // If the user or another extension already queued work, don't duplicate.
@@ -1530,7 +1738,11 @@ export default function (pi: ExtensionAPI): void {
             customType: "auto-continue-length",
             content: LENGTH_CONTINUATION_PROMPT,
             display: false,
-            details: { kind: "output_length_continuation" },
+            details: {
+              kind: "output_length_continuation",
+              epoch: state.epoch,
+              runId: RUN_ID,
+            },
           },
           { triggerTurn: true, deliverAs: "followUp" },
         );
@@ -1557,7 +1769,11 @@ export default function (pi: ExtensionAPI): void {
             customType: "auto-continue-premature",
             content: PREMATURE_STOP_PROMPT,
             display: false,
-            details: { kind: "premature_stop_continuation" },
+            details: {
+              kind: "premature_stop_continuation",
+              epoch: state.epoch,
+              runId: RUN_ID,
+            },
           },
           { triggerTurn: true, deliverAs: "followUp" },
         );
@@ -1571,6 +1787,7 @@ export default function (pi: ExtensionAPI): void {
     // The model stopped due to an error. Retry.
     if (assistant.stopReason === "error" && !state.lengthQueued && !state.prematureQueued) {
       state.lastResponseConclusive = false;
+      if (!shouldQueueFailureContinuation(assistant)) return;
       state.continuationSinceLastVerification = true;
       try {
         pi.sendMessage(
@@ -1578,7 +1795,11 @@ export default function (pi: ExtensionAPI): void {
             customType: "auto-continue-error",
             content: `Your previous response stopped due to an error. Please re-read the user's last message and try again. Do not repeat completed work from earlier turns.`,
             display: false,
-            details: { kind: "error_continuation" },
+            details: {
+              kind: "error_continuation",
+              epoch: state.epoch,
+              runId: RUN_ID,
+            },
           },
           { triggerTurn: true, deliverAs: "followUp" },
         );
@@ -1590,6 +1811,25 @@ export default function (pi: ExtensionAPI): void {
 
     // If we get here, the response was conclusive (normal stop with complete text).
     state.lastResponseConclusive = true;
+  });
+
+  // ── Stale-continuation filter ─────────────────────────────────────
+  // Fires before every LLM call and may rewrite the message list. Continuations
+  // queued during an outage are ordinary context messages (custom → user role)
+  // that outlive the interruption they describe, so after recovery the model
+  // reads several standing instructions to resume work that is already done.
+  // Drop the ones stamped with a superseded epoch.
+  //
+  // This only filters the LLM's view. The session transcript keeps every entry,
+  // so nothing is destroyed and the change is reversible by config.
+  pi.on("context", (event: { messages: AgentMessage[] }) => {
+    if (!config.staleContinuationFiltering) return;
+
+    const kept = event.messages.filter(
+      (message) => !isStaleContinuation(message, state.epoch),
+    );
+    if (kept.length === event.messages.length) return; // nothing to do
+    return { messages: kept };
   });
 
   // ── Post-compaction continuation ──────────────────────────────────────
@@ -1666,6 +1906,8 @@ export default function (pi: ExtensionAPI): void {
             details: {
               kind: "post_compaction_continuation",
               reason: event.reason,
+              epoch: state.epoch,
+              runId: RUN_ID,
             },
           },
           { triggerTurn: true, deliverAs: "steer" },

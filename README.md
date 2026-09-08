@@ -94,3 +94,23 @@ This bumps the version, updates `CHANGELOG.md`, commits, tags `v0.1.x`, pushes t
 ## License
 
 MIT © Bruno Jakic — [Ai Applied](https://ai-applied.nl)
+
+## Stale-continuation control
+
+When the provider is unreachable, every failed turn used to queue a
+continuation. Each was drained into the session and persisted, so after
+recovery the model saw several standing instructions to resume work that was
+already finished. Three mechanisms bound and expire them:
+
+- **Host-retry deferral** — the extension stays out of the way for the first
+  `hostRetryBudget` (default 3) consecutive retryable failures, leaving them to
+  Pi's own retry layer.
+- **Circuit breaker** — at most `maxConsecutiveFailureContinuations` (default 3)
+  continuations per unbroken failure streak.
+- **Run-id + epoch stamping with a context filter** — continuations queued by a
+  previous process or in a superseded epoch are dropped from the LLM context
+  before each call. Scoped to the five `auto-continue-*` customTypes; other
+  extensions' messages are never touched.
+
+All three are configurable in `pi-vigilant.json` and can be disabled via
+`staleContinuationFiltering: false`.
