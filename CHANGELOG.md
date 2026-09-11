@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-11
+
+### Added
+
+- **Compaction fallback** — compaction is the one operation a session cannot
+  route around. Pi summarizes the whole span in a single request, so a session
+  that has grown past what the provider accepts can never compact, never
+  shrinks its context, and fails every later turn the same way; the only exit is
+  a new session. The fallback keeps that from being fatal. It stays dormant
+  until compaction has actually failed (`compactionFallbackAfterFailures`,
+  default 2 consecutive non-aborted failures), then summarizes the span itself
+  in size-bounded slices and supplies the host with a compaction it accepts:
+
+  - **Chunked fold** — the span is split into slices of at most
+    `compactionFallbackChunkTokens` (default 8192) estimated tokens, each
+    summarized in its own request and chained forward through the previous
+    summary, so the result is one summary rather than a pile of fragments.
+    Nothing is dropped and the host's own cut point is kept. This is the gap
+    the fallback fills: a retry loop that shrinks the request by discarding the
+    oldest messages loses their content silently, and the summary it produces
+    then claims to describe a conversation it never saw.
+  - **Prefix cut** — when the span needs more slices than
+    `maxCompactionFallbackChunks` (default 6) allows, the fold covers a prefix
+    (about half the span by size, and only as far as the cut it will move to)
+    and moves the cut point to the end of what the summary actually saw. The
+    cut is derived from the host's `branchEntries` at a legal message boundary,
+    never by mapping message indices back onto entries and never onto a tool
+    result. Less faithful than a full fold, but the context always shrinks and
+    the next compaction usually fits again.
+
+  The slice size adapts to the model: it is raised to cover the span within the
+  chunk budget when the window allows, and clamped to what the model can accept
+  when it does not. Every request stays bounded, which is the property Pi's
+  single whole-span request does not have.
+
+- Config keys `compactionFallback`, `compactionFallbackAfterFailures`,
+  `maxCompactionFallbackAttempts`, `compactionFallbackChunkTokens`,
+  `maxCompactionFallbackChunks`, `compactionFallbackModel` (documented in
+  `README.md` and shipped in `pi-vigilant.json`).
+- Test suite `test/test-compaction-fallback.mjs` (63 checks) covering both
+  mechanisms, the arming and attempt budgets, config parsing, provider-outage
+  behaviour, ownership, and re-entrancy.
+
 ### Fixed
 
 - **Output-length continuation loop** — a starved output-length stop (the input
@@ -46,18 +89,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     output limit, or a new user message.
 
   Productive output-cap stops are unchanged: a real 32K-token response still
-  continues.
-
-### Added
-
-- Config keys `lengthContinuationMaxConsecutive`,
+  continues. The loop is now bounded by `lengthContinuationMaxConsecutive`,
   `lengthContinuationTinyOutputTokens`, `contextPressureRatio`,
-  `contextPressureCompaction`, `maxContextPressureCompactions` (documented in
-  `README.md` and shipped in `pi-vigilant.json`).
-- Test suite `test/test-length-loop.mjs` (40 checks) covering the fix doc's §6
-  plan, including a replay of the 16-starved-stop production trace
-  (`test/fixtures/length-loop-trace.json`). Against the pre-fix build the replay
-  reproduces the bug exactly: 16 continuations, 0 compactions.
+  `contextPressureCompaction` and `maxContextPressureCompactions` (documented in
+  `README.md` and shipped in `pi-vigilant.json`), and covered by
+  `test/test-length-loop.mjs` (40 checks) including a replay of the
+  16-starved-stop production trace (`test/fixtures/length-loop-trace.json`).
+  Against the pre-fix build the replay reproduces the bug exactly: 16
+  continuations, 0 compactions.
+
+### Verification
+
+- 172/172 harness checks pass against the real `index.ts` (regression 29, stale
+  30, resume 10, length loop 40, compaction fallback 63).
+- Live end-to-end against real pi with a capturing provider proxy that rejects
+  any summarization request above a byte limit — i.e. Pi's whole-span
+  summarization can never succeed:
+  - **Mechanism A** — two rejected whole-span summaries (118,831 bytes) armed the
+    fallback; four accepted bounded slices (33,844 / 34,367 / 34,367 / 22,226
+    bytes) produced a compaction with `fromHook=true`, `mechanism=chunked-fold`,
+    `coveredTokens=29,165`; the session recorded the compaction entry and the
+    turn completed.
+  - **Mechanism B** — with a window too small to cover the span in one budget
+    (8,000), the fallback produced `mechanism=prefix-cut`,
+    `coveredTokens=16,087`, `partial=true`, `fromHook=true`; the reduced span
+    then fit Pi's own summarization, which completed normally
+    (`fromHook=false`) and the turn completed.
 
 ## [0.1.4] - 2026-09-08
 

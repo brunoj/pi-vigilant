@@ -4,10 +4,29 @@
  * capturing every pi.sendMessage call.
  */
 import { createJiti } from "jiti";
+import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * jiti alias so `@earendil-works/pi-coding-agent` resolves to the generated
+ * host shim (test/setup.sh), which lets tests drive the summarizer while every
+ * other export stays the real implementation. Absent when setup.sh has not run;
+ * the real package is then used directly.
+ */
+function jitiOptions() {
+  const shim = path.join(HERE, "host-shim.mjs");
+  if (!fs.existsSync(shim)) return { interopDefault: true };
+  return {
+    interopDefault: true,
+    alias: { "@earendil-works/pi-coding-agent": shim },
+  };
+}
 
 export async function loadExtension(extPath, { agentDir } = {}) {
-  const jiti = createJiti(import.meta.url, { interopDefault: true });
+  const jiti = createJiti(import.meta.url, jitiOptions());
   const mod = await jiti.import(extPath, { default: true });
 
   const handlers = new Map();
@@ -48,7 +67,12 @@ export async function loadExtension(extPath, { agentDir } = {}) {
   const ctxDefaults = {
     hasPendingMessages: () => queue.steering.length + queue.followUp.length > 0,
     isIdle: () => false,
-    model: { contextWindow: 200000 },
+    model: { id: "test-model", provider: "test", contextWindow: 200000, maxTokens: 32000 },
+    thinkingLevel: "off",
+    modelRegistry: {
+      getAll: () => [],
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {} }),
+    },
     abort() {},
     shutdown() {},
     getContextUsage: () => undefined,
@@ -62,10 +86,18 @@ export async function loadExtension(extPath, { agentDir } = {}) {
     getSystemPrompt: () => "",
   };
 
+  /**
+   * Dispatch an event to every registered handler.
+   *
+   * Returns the handlers' results so tests can inspect what a hook such as
+   * `session_before_compact` handed back to the host.
+   */
   async function emit(event, ctxOverrides = {}) {
     const fns = handlers.get(event.type) || [];
     const ctx = { ...ctxDefaults, ...ctxOverrides };
-    for (const fn of fns) await fn(event, ctx);
+    const results = [];
+    for (const fn of fns) results.push(await fn(event, ctx));
+    return results;
   }
 
   return { pi, emit, sent, tools, commands, queue, handlers, compacted, notifications };

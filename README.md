@@ -56,7 +56,14 @@ Run `/reload` (or restart pi) after installing.
   "lengthContinuationTinyOutputTokens": 64,
   "contextPressureRatio": 0.9,
   "contextPressureCompaction": true,
-  "maxContextPressureCompactions": 2
+  "maxContextPressureCompactions": 2,
+
+  "compactionFallback": true,
+  "compactionFallbackAfterFailures": 2,
+  "maxCompactionFallbackAttempts": 3,
+  "compactionFallbackChunkTokens": 8192,
+  "maxCompactionFallbackChunks": 6,
+  "compactionFallbackModel": ""
 }
 ```
 
@@ -158,3 +165,48 @@ Four settings bound it:
 Both counters are independent of Pi's own overflow recovery: a genuine
 `isContextOverflow` stop is left to the core's compact-and-retry path, and if
 another extension has already queued work the extension stays out of the way.
+
+## Compaction fallback
+
+Compaction is the one operation a session cannot route around: if the
+summarization request cannot be served, the context never shrinks and every
+later turn fails the same way. Pi sends the whole span to be summarized in a
+single request, so a session that has grown past what the provider accepts can
+never compact — it is stuck, and the only exit is a new session.
+
+The fallback keeps that from being fatal. It stays dormant until compaction has
+actually failed (`compactionFallbackAfterFailures`, default 2, counted on
+consecutive non-aborted failures), then summarizes the span itself in
+size-bounded slices and hands the host a compaction it accepts:
+
+- **Chunked fold** — the span is split into slices of at most
+  `compactionFallbackChunkTokens` (default 8192) estimated tokens, each
+  summarized in its own request, chained forward through the previous summary so
+  the result is one summary, not a pile of fragments. Nothing is dropped: the
+  summary covers the whole span, so the host's own cut point is kept.
+- **Prefix cut** — when the span needs more slices than
+  `maxCompactionFallbackChunks` (default 6) allows, the fold summarizes a prefix
+  (about half the span by size) and moves the cut point to the end of what the
+  summary actually saw. That is a real reduction in fidelity — the kept messages
+  and the summary overlap less than they would otherwise — but the context
+  always shrinks, and the next compaction usually fits again.
+
+The slice size adapts to the model: it is raised to cover the span within the
+chunk budget when the window allows, and clamped to what the model can actually
+accept when it does not. Every request stays bounded, which is the property Pi's
+single whole-span request does not have.
+
+Ownership rules that keep it safe:
+
+- It never calls `ctx.compact()` — it only supplies a compaction when the host
+  asks for one, so it cannot race the host or double-compact.
+- Attempts are capped (`maxCompactionFallbackAttempts`, default 3). When the cap
+  is reached the extension stops and says so instead of burning requests.
+- A provider outage is not recovered from: the first slice that fails ends the
+  attempt with one clear message. A fallback that retried a dead provider would
+  just be a slower way to stay stuck.
+- `compactionFallback: false` disables the whole mechanism.
+- `compactionFallbackModel` (e.g. `"anthropic/claude-sonnet-4-5"`) summarizes
+  with a different model than the session uses — useful when the session model
+  cannot take the span but another configured model can. Empty means the session
+  model.

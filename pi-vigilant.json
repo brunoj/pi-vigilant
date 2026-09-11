@@ -6,16 +6,21 @@
   "finalVerification": true,
   "feedbackMemoryIntegration": true,
   "specMemoryIntegration": true,
-
   "staleContinuationComment": "Continuations queued while the provider was unreachable become permanent context messages. These three settings bound how many are queued and drop the ones whose interruption is over.",
   "staleContinuationFiltering": true,
   "maxConsecutiveFailureContinuations": 3,
   "hostRetryBudget": 3,
-
   "lengthLoopComment": "A starved output-length stop (the input has eaten the window, so the model can only emit a token or two) is not worth continuing: each continuation grows the input while the output stays tiny, until the request overflows. These settings detect that state and compact instead of continuing, and bound the continuations that remain.",
   "lengthContinuationMaxConsecutive": 3,
   "lengthContinuationTinyOutputTokens": 64,
   "contextPressureRatio": 0.9,
   "contextPressureCompaction": true,
-  "maxContextPressureCompactions": 2
+  "maxContextPressureCompactions": 2,
+  "compactionFallbackComment": "Compaction fallback: Pi summarizes the whole span in one request, so a session that has grown past what the provider accepts can never compact and is stuck. After compactionFallbackAfterFailures consecutive non-aborted failures the extension summarizes the span itself in size-bounded slices (chunked fold, chained through the previous summary) and hands the host a compaction it accepts. When the span needs more slices than maxCompactionFallbackChunks, it summarizes a prefix and moves the cut point to the end of what the summary saw (prefix cut) \u2014 less faithful, but the context always shrinks. It never calls ctx.compact() itself, attempts are capped, and a provider outage is not retried: the first failed slice ends the attempt with one message.",
+  "compactionFallback": true,
+  "compactionFallbackAfterFailures": 2,
+  "maxCompactionFallbackAttempts": 3,
+  "compactionFallbackChunkTokens": 8192,
+  "maxCompactionFallbackChunks": 6,
+  "compactionFallbackModel": ""
 }
