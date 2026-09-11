@@ -1,6 +1,6 @@
 {
   "name": "pi-vigilant",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "A diligence layer for pi: auto-continue after output-length stops, premature stops, and threshold compaction, plus spec-memory (hard specification tracking & verification) and feedback-memory (behavior criticism checkpoints).",
   "keywords": [
     "pi-package"
