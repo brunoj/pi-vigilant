@@ -41,10 +41,13 @@ EOF
 git add package.json CHANGELOG.md
 [ -f package-lock.json ] && git add package-lock.json
 git commit -m "chore: release $NEW_VERSION"
-git tag "$NEW_VERSION"
+# Annotated on purpose: `git push --follow-tags` only pushes annotated tags, so a
+# lightweight tag here would leave the release untagged on GitHub.
+git tag -a "$NEW_VERSION" -m "Release $NEW_VERSION"
 
 # Push and publish
 git push --follow-tags
+git push origin "$NEW_VERSION"
 npm publish
 
 echo ""
