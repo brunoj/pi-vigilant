@@ -14,6 +14,8 @@ export async function loadExtension(extPath, { agentDir } = {}) {
   const sent = [];
   const tools = new Map();
   const commands = new Map();
+  const compacted = [];
+  const notifications = [];
 
   // Session-side queue simulation (mirrors agent-session pendingMessageCount)
   const queue = { steering: [], followUp: [] };
@@ -50,7 +52,13 @@ export async function loadExtension(extPath, { agentDir } = {}) {
     abort() {},
     shutdown() {},
     getContextUsage: () => undefined,
-    compact() {},
+    compact(opts) { compacted.push(opts ?? {}); },
+    ui: {
+      notify(message, type) { notifications.push({ message, type }); },
+      confirm: async () => true,
+      select: async () => undefined,
+      input: async () => undefined,
+    },
     getSystemPrompt: () => "",
   };
 
@@ -60,15 +68,36 @@ export async function loadExtension(extPath, { agentDir } = {}) {
     for (const fn of fns) await fn(event, ctx);
   }
 
-  return { pi, emit, sent, tools, commands, queue, handlers };
+  return { pi, emit, sent, tools, commands, queue, handlers, compacted, notifications };
 }
 
 /** Build an assistant message with a given stopReason and text. */
-export function assistantMsg({ stopReason = "stop", text = "Done.", toolCalls = 0 } = {}) {
+export function assistantMsg({
+  stopReason = "stop",
+  text = "Done.",
+  toolCalls = 0,
+  usage = {},
+  errorMessage,
+} = {}) {
   const content = [];
   for (let i = 0; i < toolCalls; i++) {
     content.push({ type: "toolCall", id: `tc${i}`, name: "bash", arguments: {} });
   }
   if (text !== null) content.push({ type: "text", text });
-  return { role: "assistant", content, stopReason, timestamp: Date.now(), usage: { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 20, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+  return {
+    role: "assistant",
+    content,
+    stopReason,
+    errorMessage,
+    timestamp: Date.now(),
+    usage: {
+      input: 10,
+      output: 10,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 20,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      ...usage,
+    },
+  };
 }

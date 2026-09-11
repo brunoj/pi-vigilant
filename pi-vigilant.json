@@ -10,5 +10,12 @@
   "staleContinuationComment": "Continuations queued while the provider was unreachable become permanent context messages. These three settings bound how many are queued and drop the ones whose interruption is over.",
   "staleContinuationFiltering": true,
   "maxConsecutiveFailureContinuations": 3,
-  "hostRetryBudget": 3
+  "hostRetryBudget": 3,
+
+  "lengthLoopComment": "A starved output-length stop (the input has eaten the window, so the model can only emit a token or two) is not worth continuing: each continuation grows the input while the output stays tiny, until the request overflows. These settings detect that state and compact instead of continuing, and bound the continuations that remain.",
+  "lengthContinuationMaxConsecutive": 3,
+  "lengthContinuationTinyOutputTokens": 64,
+  "contextPressureRatio": 0.9,
+  "contextPressureCompaction": true,
+  "maxContextPressureCompactions": 2
 }

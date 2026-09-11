@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Output-length continuation loop** — a starved output-length stop (the input
+  had consumed the window, so the model could only emit a token or two) queued a
+  continuation that made the input larger while the output stayed tiny, until the
+  request overflowed. A production session
+  (`2026-09-07T21-26-34-232Z_01a07dc4`) ran 16 consecutive starved stops, adding
+  ~79 input tokens each time, 166,660 → 167,924 against a 168,000 window. Three
+  defects, all in the length path:
+
+  1. **`lengthQueued` was reset on every `agent_start`** — including the run the
+     continuation itself started, so the guard was cleared immediately after it
+     was used and Case 1 was eligible again on the next starved stop. The field
+     only ever prevented double-queueing within a single run; it was never a loop
+     bound.
+  2. **The only context guard was `isContextOverflow`** — which detects a
+     provider-reported overflow *error*. A context-starved *length* stop is not an
+     error (the request succeeded and returned a token), so the guard never fired
+     in the failing case.
+  3. **The failure circuit breaker did not cover length stops** — the streak
+     counter that bounds error continuations never saw them.
+
+  The length path now classifies every stop and bounds the streak:
+
+  - **Starvation detection** — a length stop with `output <=
+    lengthContinuationTinyOutputTokens` (default 64) is context-starved.
+  - **Compaction instead of continuation** — a starved stop while the input is at
+    least `contextPressureRatio` (default 0.9) of the window, or after
+    `lengthContinuationMaxConsecutive` starved stops, calls `ctx.compact()`
+    rather than continuing, so the work resumes on a fresh window.
+  - **Compaction cap** — at most `maxContextPressureCompactions` (default 2) per
+    streak, with a 60s cooldown; the cap deliberately survives a successful
+    compaction, otherwise each compaction would re-arm its own bound.
+  - **Surviving circuit breaker** — at most `lengthContinuationMaxConsecutive`
+    (default 3) continuations per unbroken streak, counted across run
+    boundaries. It resets only on real progress: a turn that did not stop on the
+    output limit, or a new user message.
+
+  Productive output-cap stops are unchanged: a real 32K-token response still
+  continues.
+
+### Added
+
+- Config keys `lengthContinuationMaxConsecutive`,
+  `lengthContinuationTinyOutputTokens`, `contextPressureRatio`,
+  `contextPressureCompaction`, `maxContextPressureCompactions` (documented in
+  `README.md` and shipped in `pi-vigilant.json`).
+- Test suite `test/test-length-loop.mjs` (40 checks) covering the fix doc's §6
+  plan, including a replay of the 16-starved-stop production trace
+  (`test/fixtures/length-loop-trace.json`). Against the pre-fix build the replay
+  reproduces the bug exactly: 16 continuations, 0 compactions.
+
 ## [0.1.4] - 2026-09-08
 
 ### Fixed

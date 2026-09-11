@@ -1,0 +1,20 @@
+{
+  "comment": "Literal production trace from session 2026-09-07T21-26-34-232Z_01a07dc4 (PI-VIGILANT-LENGTH-LOOP-FIX.md §2). 16 consecutive starved output-length stops: the model could only emit one token because the input had consumed almost the entire window. Each round adds ~79 input tokens (the continuation prompt plus the 1-token reply) until the request overflows into an error turn.",
+  "session": "2026-09-07T21-26-34-232Z_01a07dc4",
+  "model": "ai-applied-infra/automatic",
+  "contextWindow": 168000,
+  "maxTokens": 32000,
+  "stops": {
+    "count": 16,
+    "stopReason": "length",
+    "output": 1,
+    "inputStart": 166660,
+    "inputStep": 79
+  },
+  "terminal": {
+    "stopReason": "error",
+    "output": 0,
+    "input": 0,
+    "errorMessage": "Model stopped because it reached the maximum output token limit. The response may be incomplete."
+  }
+}

@@ -46,7 +46,17 @@ Run `/reload` (or restart pi) after installing.
   "compactionContinuation": true,
   "finalVerification": true,
   "feedbackMemoryIntegration": true,
-  "specMemoryIntegration": true
+  "specMemoryIntegration": true,
+
+  "staleContinuationFiltering": true,
+  "maxConsecutiveFailureContinuations": 3,
+  "hostRetryBudget": 3,
+
+  "lengthContinuationMaxConsecutive": 3,
+  "lengthContinuationTinyOutputTokens": 64,
+  "contextPressureRatio": 0.9,
+  "contextPressureCompaction": true,
+  "maxContextPressureCompactions": 2
 }
 ```
 
@@ -114,3 +124,37 @@ already finished. Three mechanisms bound and expire them:
 
 All three are configurable in `pi-vigilant.json` and can be disabled via
 `staleContinuationFiltering: false`.
+
+## Output-length loop control
+
+A model that hits its output cap mid-response (`stopReason: "length"`) gets a
+follow-up so it can finish. That is right for a *productive* stop — a real
+32K-token answer that needs a second turn. It is a trap for a *starved* stop:
+when the input has already consumed the window, the model can only emit a token
+or two, and every continuation makes the input larger while the output stays
+tiny. Left alone that loop runs until the request overflows.
+
+Four settings bound it:
+
+- **Tiny-output detection** — a length stop with `output <=
+  lengthContinuationTinyOutputTokens` (default 64) counts as context-starved.
+- **Context-pressure compaction** — a starved stop while the input is at least
+  `contextPressureRatio` (default 0.9) of the window does not continue at all;
+  the extension calls `ctx.compact()` instead, so the work resumes on a fresh
+  window rather than a fuller one. Set `contextPressureCompaction: false` to
+  fall back to the breaker below.
+- **Consecutive-continuation breaker** — at most
+  `lengthContinuationMaxConsecutive` (default 3) continuations per unbroken
+  streak, counted across run boundaries (a `lengthQueued` flag reset on every
+  `agent_start` is what made the original loop unbounded). The counter resets on
+  real progress: any turn that does not stop on the output limit, or a new user
+  message.
+- **Compaction cap** — at most `maxContextPressureCompactions` (default 2)
+  context-pressure compactions per streak, with a 60s cooldown between them.
+  When the cap is reached the extension stops and warns instead of compacting in
+  a loop; that budget deliberately survives a successful compaction, otherwise
+  each compaction would re-arm its own cap.
+
+Both counters are independent of Pi's own overflow recovery: a genuine
+`isContextOverflow` stop is left to the core's compact-and-retry path, and if
+another extension has already queued work the extension stays out of the way.

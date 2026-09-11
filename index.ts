@@ -84,6 +84,16 @@ interface ExtensionConfig {
    * before stepping in. Should mirror the host's `retry.maxRetries` (default 3).
    */
   hostRetryBudget: number;
+  /** Consecutive length continuations allowed before pausing, per unbroken streak. */
+  lengthContinuationMaxConsecutive: number;
+  /** Output at or below this marks a length stop as context-starved. */
+  lengthContinuationTinyOutputTokens: number;
+  /** Fraction of the context window considered "nearly full". */
+  contextPressureRatio: number;
+  /** Compact (instead of continuing) when a length stop is starved and the window is nearly full. */
+  contextPressureCompaction: boolean;
+  /** Hard cap on context-pressure compactions per unbroken streak. */
+  maxContextPressureCompactions: number;
 }
 
 function loadConfig(): ExtensionConfig {
@@ -115,6 +125,24 @@ function loadConfig(): ExtensionConfig {
           parsed.hostRetryBudget,
           DEFAULT_HOST_RETRY_BUDGET,
         ),
+        lengthContinuationMaxConsecutive: normalizeCount(
+          parsed.lengthContinuationMaxConsecutive,
+          DEFAULT_LENGTH_CONTINUATION_MAX_CONSECUTIVE,
+        ),
+        lengthContinuationTinyOutputTokens: normalizeCount(
+          parsed.lengthContinuationTinyOutputTokens,
+          DEFAULT_LENGTH_CONTINUATION_TINY_OUTPUT_TOKENS,
+        ),
+        contextPressureRatio: normalizeRatio(
+          parsed.contextPressureRatio,
+          DEFAULT_CONTEXT_PRESSURE_RATIO,
+        ),
+        contextPressureCompaction:
+          parsed.contextPressureCompaction !== false,
+        maxContextPressureCompactions: normalizeCount(
+          parsed.maxContextPressureCompactions,
+          DEFAULT_MAX_CONTEXT_PRESSURE_COMPACTIONS,
+        ),
       };
     }
   } catch {
@@ -131,6 +159,13 @@ function loadConfig(): ExtensionConfig {
     maxConsecutiveFailureContinuations:
       DEFAULT_MAX_CONSECUTIVE_FAILURE_CONTINUATIONS,
     hostRetryBudget: DEFAULT_HOST_RETRY_BUDGET,
+    lengthContinuationMaxConsecutive:
+      DEFAULT_LENGTH_CONTINUATION_MAX_CONSECUTIVE,
+    lengthContinuationTinyOutputTokens:
+      DEFAULT_LENGTH_CONTINUATION_TINY_OUTPUT_TOKENS,
+    contextPressureRatio: DEFAULT_CONTEXT_PRESSURE_RATIO,
+    contextPressureCompaction: true,
+    maxContextPressureCompactions: DEFAULT_MAX_CONTEXT_PRESSURE_COMPACTIONS,
   };
 }
 
@@ -171,6 +206,13 @@ const DEFAULT_MAX_CONSECUTIVE_FAILURE_CONTINUATIONS = 3;
 /** Default assumed host retry budget (Pi's `retry.maxRetries` default is 3). */
 const DEFAULT_HOST_RETRY_BUDGET = 3;
 
+/** §5.1 — output-length continuation loop bounds (see Case 1 in agent_end). */
+const DEFAULT_LENGTH_CONTINUATION_MAX_CONSECUTIVE = 3;
+const DEFAULT_LENGTH_CONTINUATION_TINY_OUTPUT_TOKENS = 64;
+const DEFAULT_CONTEXT_PRESSURE_RATIO = 0.9;
+const DEFAULT_MAX_CONTEXT_PRESSURE_COMPACTIONS = 2;
+const CONTEXT_PRESSURE_COMPACTION_COOLDOWN_MS = 60_000;
+
 /**
  * customTypes this extension queues. The context filter only ever considers
  * these, so custom messages from other extensions are never touched.
@@ -201,6 +243,19 @@ function normalizeCount(value: unknown, fallback: number): number {
     return fallback;
   }
   return Math.floor(value);
+}
+
+/**
+ * Coerce a config value to a fraction in (0, 1], falling back to a default.
+ *
+ * Deliberately NOT `normalizeCount`: that floors, which would turn the default
+ * `contextPressureRatio` of 0.9 into 0 — making every window look "nearly full"
+ * and compacting constantly.
+ */
+function normalizeRatio(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  if (value <= 0 || value > 1) return fallback;
+  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +649,14 @@ interface ContinuationState {
   consecutiveFailures: number;
   /** Continuations queued during the current failure streak (bounded by config). */
   failureContinuationsQueued: number;
+  /** Consecutive output-length continuations since the last real progress. */
+  lengthContinuationsQueued: number;
+  /** Consecutive context-starved length stops. */
+  starvedLengthStreak: number;
+  /** Context-pressure compactions requested in the current streak. */
+  contextPressureCompactionsQueued: number;
+  /** Timestamp (ms) of the last context-pressure compaction request. */
+  lastContextPressureCompactionTime: number;
   /** Number of tool calls in the last agent run (used to detect simple Q&A vs complex task). */
   lastRunToolCallCount: number;
   /** Tool calls since the last genuine user message (task boundary). */
@@ -788,6 +851,10 @@ export default function (pi: ExtensionAPI): void {
     epoch: 0,
     consecutiveFailures: 0,
     failureContinuationsQueued: 0,
+    lengthContinuationsQueued: 0,
+    starvedLengthStreak: 0,
+    contextPressureCompactionsQueued: 0,
+    lastContextPressureCompactionTime: 0,
     lastRunToolCallCount: 0,
     taskToolCallCount: 0,
     sessionTotalToolCalls: 0,
@@ -1553,6 +1620,11 @@ export default function (pi: ExtensionAPI): void {
   // reset the counter — they're part of the same task.
   pi.on("input", (event: { text: string; source: string }, _ctx: ExtensionContext) => {
     if (event.source === "extension") return;
+
+    // §5.4 — a genuine user message is real progress: the length loop gets a
+    // fresh budget, matching pi-safe-compact's precedent.
+    noteLengthProgress();
+
     state.taskToolCallCount = 0;
 
     // A genuine user message starts a NEW task, so the previous task's
@@ -1604,7 +1676,18 @@ export default function (pi: ExtensionAPI): void {
   // Reset guards at the start of each agent run so a later run can
   // enqueue its own continuation.
   pi.on("agent_start", () => {
-    state.lengthQueued = false;
+    // §5.4 — `state.lengthQueued` is no longer cleared unconditionally here.
+    // The per-stop guard is re-armed only while the length streak still has
+    // budget; once `lengthContinuationsQueued` reaches its limit the guard
+    // stays armed, so no further continuation can be queued even if some other
+    // path would try. The streak counters themselves are NOT touched here —
+    // they are the loop bound and must survive run boundaries.
+    if (
+      state.lengthContinuationsQueued <
+      config.lengthContinuationMaxConsecutive
+    ) {
+      state.lengthQueued = false;
+    }
     state.compactionQueued = false;
     state.prematureQueued = false;
     state.lastRunToolCallCount = 0;
@@ -1660,6 +1743,36 @@ export default function (pi: ExtensionAPI): void {
   }
 
   /**
+   * §5.4 — real progress on the output-length path.
+   *
+   * Clears the length-loop counters and re-arms `lengthQueued`. Called only for
+   * turns that genuinely moved forward (a non-length stop, or a new user
+   * message) — never for a length stop, which is exactly the case the loop is
+   * made of.
+   */
+  function noteLengthProgress(): void {
+    state.lengthContinuationsQueued = 0;
+    state.starvedLengthStreak = 0;
+    state.contextPressureCompactionsQueued = 0;
+    state.lengthQueued = false;
+  }
+
+  /**
+   * A compaction produced a fresh window.
+   *
+   * The length budget restarts — the context is small again — but the
+   * context-pressure compaction budget deliberately survives: that counter is
+   * the one that stops a compact → starve → compact loop (§5.5 step 1a). If a
+   * successful compaction reset it, every compaction would re-arm its own cap
+   * and the loop would never end.
+   */
+  function noteFreshWindow(): void {
+    state.lengthContinuationsQueued = 0;
+    state.starvedLengthStreak = 0;
+    state.lengthQueued = false;
+  }
+
+  /**
    * A turn completed without failing. Close out any failure streak: bump the
    * epoch so continuations queued during the outage are recognised as stale,
    * and reset the streak counters.
@@ -1707,8 +1820,19 @@ export default function (pi: ExtensionAPI): void {
     // A turn that produced a message and did not error ends any failure streak
     // and retires the continuations queued during it. Length/premature stops are
     // incomplete responses, not failed calls, so they count as progress here.
+    // §5.7 (decided): this stays true for starved length stops too. Failure and
+    // length are separate concerns — the provider answered successfully, so the
+    // turn is not a failure. In a pure length loop `consecutiveFailures` is 0,
+    // so no epoch bump happens and no continuation is retired by this call.
     if (assistant.stopReason !== "error") {
       noteSuccessfulTurn();
+    }
+
+    // §5.4 — a turn that did not stop on the output limit is real progress on
+    // the length path: reset the loop counters so the next length stop starts
+    // from a fresh budget. A length stop is handled in Case 1 below.
+    if (assistant.stopReason !== "length") {
+      noteLengthProgress();
     }
 
     // If the user or another extension already queued work, don't duplicate.
@@ -1720,14 +1844,111 @@ export default function (pi: ExtensionAPI): void {
     state.sessionTotalToolCalls += state.lastRunToolCallCount;
 
     // ── Case 1: Output-length stop ──────────────────────────────────
+    // The per-stop guard (`lengthQueued`) is applied at the queueing step
+    // below, not here: the context-pressure and circuit-breaker checks must
+    // still run for every length stop, otherwise the pause would be silent.
     if (
       config.lengthStopContinuation &&
-      assistant.stopReason === "length" &&
-      !state.lengthQueued
+      assistant.stopReason === "length"
     ) {
-      // A length stop with no output and input filling the context window is
-      // a context-overflow signal handled by Pi's compact-and-retry path.
+      // Pi core owns genuine context-overflow recovery (abort + compact + retry).
       if (isContextOverflow(assistant, ctx.model?.contextWindow)) return;
+
+      const usage = assistant.usage;
+      const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+      const contextWindow = ctx.model?.contextWindow;
+      const tinyOutput =
+        usage.output <= config.lengthContinuationTinyOutputTokens;
+      const contextNearlyFull =
+        typeof contextWindow === "number" &&
+        Number.isFinite(contextWindow) &&
+        contextWindow > 0 &&
+        inputTokens >= contextWindow * config.contextPressureRatio;
+
+      // ── 1a: context-starved stop — a continuation cannot help ──────
+      // Continuing appends to an already-full context, so input grows while
+      // output stays tiny. This is strictly self-reinforcing: compact instead.
+      if (
+        config.contextPressureCompaction &&
+        tinyOutput &&
+        (contextNearlyFull ||
+          state.starvedLengthStreak + 1 >=
+            config.lengthContinuationMaxConsecutive)
+      ) {
+        state.starvedLengthStreak++;
+        state.lastResponseConclusive = false;
+
+        // Hard cap: never compact in a loop.
+        if (
+          state.contextPressureCompactionsQueued >=
+          config.maxContextPressureCompactions
+        ) {
+          ctx.ui.notify(
+            "Context remains exhausted after automatic compaction. Stopping automatic continuations; start a new session or select a larger-context model.",
+            "warning",
+          );
+          return;
+        }
+
+        const now = Date.now();
+        if (
+          now - state.lastContextPressureCompactionTime <
+          CONTEXT_PRESSURE_COMPACTION_COOLDOWN_MS
+        ) {
+          return;
+        }
+        state.lastContextPressureCompactionTime = now;
+        state.contextPressureCompactionsQueued++;
+        state.lengthQueued = true;
+        state.continuationSinceLastVerification = true;
+
+        ctx.ui.notify(
+          `Context is exhausted (${inputTokens.toLocaleString()} / ${
+            contextWindow?.toLocaleString() ?? "?"
+          } input tokens, only ${usage.output} output tokens possible) — compacting instead of continuing.`,
+          "warning",
+        );
+        ctx.compact({
+          customInstructions:
+            "The previous turn stopped because the input had consumed nearly the entire " +
+            "context window, leaving no output budget (the model could only emit a token " +
+            "or two). Preserve the user's most recent request verbatim and the exact state " +
+            "of the in-flight work so it can be resumed immediately after this summary.",
+          onError: (error) => {
+            ctx.ui.notify(
+              `Context-pressure compaction failed: ${error.message}`,
+              "error",
+            );
+          },
+        });
+        return;
+      }
+
+      // ── 1b: circuit breaker on productive continuations ────────────
+      // `agent_start` no longer clears this, so it survives run boundaries
+      // and actually bounds the streak.
+      if (
+        state.lengthContinuationsQueued >=
+        config.lengthContinuationMaxConsecutive
+      ) {
+        ctx.ui.notify(
+          `Paused after ${state.lengthContinuationsQueued} consecutive output-length continuations. Inspect the output limit and context before continuing.`,
+          "warning",
+        );
+        return;
+      }
+
+      // Per-stop guard: never queue a second continuation for the same stop.
+      // Cleared by noteLengthProgress() on real progress and re-armed at
+      // `agent_start` while the streak still has budget.
+      if (state.lengthQueued) return;
+
+      state.lengthContinuationsQueued++;
+      if (tinyOutput) state.starvedLengthStreak++;
+      // A productive stop is progress against starvation even though it does not
+      // reset the continuation budget: the model is no longer boxed in by the
+      // context, so the starvation streak ends here (§5.5).
+      else state.starvedLengthStreak = 0;
 
       state.lengthQueued = true;
       state.lastResponseConclusive = false;
@@ -1836,6 +2057,12 @@ export default function (pi: ExtensionAPI): void {
   pi.on(
     "session_compact",
     (event: SessionCompactEvent, ctx: ExtensionContext) => {
+      // §5.4 — a fresh window deserves a fresh length budget. This resets the
+      // length counters only; the context-pressure compaction budget survives
+      // so the compaction cap can actually stop a compact → starve → compact
+      // loop. Placed before the config gate so the reset always happens.
+      noteFreshWindow();
+
       if (!config.compactionContinuation) return;
 
       // Manual /compact is user-requested maintenance — stay idle.
