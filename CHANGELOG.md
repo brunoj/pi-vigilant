@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-12
+
+### Fixed
+- Context-overflow error recovery (Case 3a) no longer re-queues a
+  self-reinforcing continuation and no longer compacts from `agent_end` (the
+  emission is not awaited by the run loop, so the compact raced the host's
+  overflow recovery and hit a stale ctx). The retry compact now runs from
+  `agent_settled`, where the session is idle and not yet disposed; the handler
+  blocks until the resumed run settles, so the print mode cannot dispose the
+  session mid-run. The cap/cooldown block further overflow retries, and a
+  failed retry notifies the operator without hanging.
+- `session_compact_failed` with `reason: "overflow"` arms the bounded-slice
+  fallback immediately (the host's whole-span summary is itself rejected when
+  the span is at the limit) instead of waiting for the general 2-failure
+  threshold.
+
 ## [0.3.0] - 2026-09-12
 
 ### Added

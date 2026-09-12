@@ -36,6 +36,7 @@ export async function loadExtension(extPath, { agentDir } = {}) {
   const commands = new Map();
   const compacted = [];
   const notifications = [];
+  let failNextCompact = false;
 
   // Session-side queue simulation (mirrors agent-session pendingMessageCount)
   const queue = { steering: [], followUp: [] };
@@ -83,7 +84,18 @@ export async function loadExtension(extPath, { agentDir } = {}) {
     abort() {},
     shutdown() {},
     getContextUsage: () => undefined,
-    compact(opts) { compacted.push(opts ?? {}); },
+    compact(opts) {
+      compacted.push(opts ?? {});
+      // Simulate the host completing the compact synchronously (the real host
+      // is fire-and-forget; the extension waits on the callbacks). Tests can
+      // arm a failure with failNextCompact().
+      if (failNextCompact) {
+        failNextCompact = false;
+        opts?.onError?.(new Error("compaction failed"));
+      } else {
+        opts?.onComplete?.({ tokens: 50000, contextWindow: 168000 });
+      }
+    },
     ui: {
       notify(message, type) { notifications.push({ message, type }); },
       confirm: async () => true,
@@ -107,7 +119,13 @@ export async function loadExtension(extPath, { agentDir } = {}) {
     return results;
   }
 
-  return { pi, emit, sent, userMessages, tools, commands, queue, handlers, compacted, notifications };
+  return {
+    pi, emit, sent, userMessages, tools, commands, queue, handlers, compacted, notifications,
+    /** Make the next ctx.compact() fire onError instead of onComplete. */
+    failNextCompact() {
+      failNextCompact = true;
+    },
+  };
 }
 
 /** Build an assistant message with a given stopReason and text. */

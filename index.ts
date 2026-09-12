@@ -868,6 +868,14 @@ interface ContinuationState {
   compactionFallbackActive: boolean;
   /** Whether the attempt-cap message has already been shown. */
   compactionFallbackExhausted: boolean;
+  /** True while the agent_settled overflow retry is awaiting the resumed run. */
+  overflowRetryInFlight: boolean;
+  /** Resolver for the resumed run's agent_settled (overflow retry only). */
+  overflowRetryResume: (() => void) | null;
+  /** True when the overflow retry's continuation was queued (compact succeeded). */
+  overflowRetryQueued: boolean;
+  /** Set when the cap/cooldown blocks recovery; cleared by a successful compact. */
+  overflowRetryBlocked: boolean;
   /** Number of tool calls in the last agent run (used to detect simple Q&A vs complex task). */
   lastRunToolCallCount: number;
   /** Tool calls since the last genuine user message (task boundary). */
@@ -1071,6 +1079,10 @@ export default function (pi: ExtensionAPI): void {
     compactionFallbackAttempts: 0,
     compactionFallbackActive: false,
     compactionFallbackExhausted: false,
+    overflowRetryInFlight: false,
+    overflowRetryResume: null,
+    overflowRetryQueued: false,
+    overflowRetryBlocked: false,
     lastRunToolCallCount: 0,
     taskToolCallCount: 0,
     sessionTotalToolCalls: 0,
@@ -1156,7 +1168,12 @@ export default function (pi: ExtensionAPI): void {
   // A model change or a compaction changes the context: re-derivation is
   // recovery, not a loop.
   pi.on("model_select", () => loopGuardian.reset());
-  pi.on("session_compact", () => loopGuardian.reset());
+  pi.on("session_compact", () => {
+    loopGuardian.reset();
+    // A compaction succeeded: the context is fresh again, so the cap/cooldown
+    // block on further overflow recovery no longer applies.
+    state.overflowRetryBlocked = false;
+  });
 
   // ======================================================================
   // FEEDBACK MEMORY TOOLS
@@ -2038,6 +2055,28 @@ export default function (pi: ExtensionAPI): void {
   }
 
   /**
+   * Whether the session context is nearly full, based on the host's context
+   * usage estimate.
+   *
+   * Error messages carry all-zero usage (the request failed before any tokens
+   * were counted), so the context-pressure check for the error path must come
+   * from the host's estimate rather than `assistant.usage`.
+   */
+  function contextUsageNearlyFull(ctx: ExtensionContext): boolean {
+    const usage = ctx.getContextUsage?.();
+    const tokens = usage?.tokens;
+    const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+    return (
+      typeof tokens === "number" &&
+      Number.isFinite(tokens) &&
+      typeof contextWindow === "number" &&
+      Number.isFinite(contextWindow) &&
+      contextWindow > 0 &&
+      tokens >= contextWindow * config.contextPressureRatio
+    );
+  }
+
+  /**
    * §5.4 — real progress on the output-length path.
    *
    * Clears the length-loop counters and re-arms `lengthQueued`. Called only for
@@ -2050,6 +2089,47 @@ export default function (pi: ExtensionAPI): void {
     state.starvedLengthStreak = 0;
     state.contextPressureCompactionsQueued = 0;
     state.lengthQueued = false;
+  }
+
+  /**
+   * A failed turn (error stop).
+   *
+   * The length loop is over, but the context is still exhausted — the
+   * context-pressure compaction budget must survive the failure so the error
+   * path cannot bypass the cap. Real progress (a successful turn or a new
+   * user message) resets it via noteLengthProgress / noteFreshWindow.
+   */
+  function noteErrorTurn(): void {
+    state.lengthContinuationsQueued = 0;
+    state.starvedLengthStreak = 0;
+    state.lengthQueued = false;
+  }
+
+  /**
+   * Resume an interrupted turn after a context-overflow compaction succeeded.
+   *
+   * Used by both the Case 3a compact (agent_end) and the fallback retry compact
+   * (session_compact_failed). The continuation is the same auto-continue-error
+   * message the old code queued, but only AFTER the context actually fits.
+   */
+  function queueErrorResumeContinuation(): void {
+    try {
+      pi.sendMessage(
+        {
+          customType: "auto-continue-error",
+          content: `Your previous response stopped due to an error. Please re-read the user's last message and try again. Do not repeat completed work from earlier turns.`,
+          display: false,
+          details: {
+            kind: "error_continuation",
+            epoch: state.epoch,
+            runId: RUN_ID,
+          },
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } catch {
+      // Agent may be in a state that rejects messages
+    }
   }
 
   /**
@@ -2475,7 +2555,7 @@ export default function (pi: ExtensionAPI): void {
   }
 
   // ── Single agent_end handler covering length + premature stops ───────
-  pi.on("agent_end", (event: AgentEndEvent, ctx: ExtensionContext) => {
+  pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
     const assistant = lastAssistantMessage(event.messages);
 
     // ── Case 0: No assistant message at all (provider aborted mid-generation) ──
@@ -2520,8 +2600,15 @@ export default function (pi: ExtensionAPI): void {
     // §5.4 — a turn that did not stop on the output limit is real progress on
     // the length path: reset the loop counters so the next length stop starts
     // from a fresh budget. A length stop is handled in Case 1 below.
+    // An error turn is NOT progress — the request failed and the context is
+    // still exhausted, so the context-pressure compaction budget must survive
+    // it (otherwise the error path could bypass the cap).
     if (assistant.stopReason !== "length") {
-      noteLengthProgress();
+      if (assistant.stopReason === "error") {
+        noteErrorTurn();
+      } else {
+        noteLengthProgress();
+      }
     }
 
     // If the user or another extension already queued work, don't duplicate.
@@ -2572,6 +2659,7 @@ export default function (pi: ExtensionAPI): void {
           state.contextPressureCompactionsQueued >=
           config.maxContextPressureCompactions
         ) {
+          state.overflowRetryBlocked = true;
           ctx.ui.notify(
             "Context remains exhausted after automatic compaction. Stopping automatic continuations; start a new session or select a larger-context model.",
             "warning",
@@ -2603,11 +2691,12 @@ export default function (pi: ExtensionAPI): void {
             "context window, leaving no output budget (the model could only emit a token " +
             "or two). Preserve the user's most recent request verbatim and the exact state " +
             "of the in-flight work so it can be resumed immediately after this summary.",
-          onError: (error) => {
-            ctx.ui.notify(
-              `Context-pressure compaction failed: ${error.message}`,
-              "error",
-            );
+          onError: () => {
+            // The ctx is stale here: the compact may have replaced the session
+            // (or the turn ended) before this async callback fires, so
+            // ctx.ui.notify would throw. The host emits session_compact_failed
+            // on failure; pi-vigilant's handler (fresh ctx) notifies and arms
+            // the compaction fallback.
           },
         });
         return;
@@ -2697,6 +2786,67 @@ export default function (pi: ExtensionAPI): void {
     // The model stopped due to an error. Retry.
     if (assistant.stopReason === "error" && !state.lengthQueued && !state.prematureQueued) {
       state.lastResponseConclusive = false;
+
+      // ── 3a: context overflow — a continuation cannot help ──────────
+      // Re-queueing the same overflowing request is strictly self-reinforcing:
+      // the provider rejects it every time (input + requested output exceeds
+      // the context window) and each retry grows the input a little more. The
+      // host's own overflow recovery tries once per turn and gives up, and its
+      // threshold compaction does not account for the output budget, so the
+      // effective limit (window − output budget) can be crossed while the host
+      // still thinks there is room. Compact instead; the compaction fallback
+      // supplies a size-bounded summary when the host's whole-span summary is
+      // itself rejected. On success, resume the interrupted turn automatically.
+      if (
+        config.contextPressureCompaction &&
+        (isContextOverflow(assistant, ctx.model?.contextWindow) ||
+          contextUsageNearlyFull(ctx))
+      ) {
+        // Hard cap: never compact in a loop.
+        if (
+          state.contextPressureCompactionsQueued >=
+          config.maxContextPressureCompactions
+        ) {
+          state.overflowRetryBlocked = true;
+          ctx.ui.notify(
+            "Context remains exhausted after automatic compaction. Stopping automatic continuations; start a new session or select a larger-context model.",
+            "warning",
+          );
+          return;
+        }
+        const now = Date.now();
+        if (
+          now - state.lastContextPressureCompactionTime <
+          CONTEXT_PRESSURE_COMPACTION_COOLDOWN_MS
+        ) {
+          state.overflowRetryBlocked = true;
+          ctx.ui.notify(
+            "Context overflow detected, but a compaction ran moments ago. Waiting for the cooldown before compacting again.",
+            "warning",
+          );
+          return;
+        }
+        state.lastContextPressureCompactionTime = now;
+        state.contextPressureCompactionsQueued++;
+        state.continuationSinceLastVerification = true;
+
+        ctx.ui.notify(
+          "Context overflow: the request exceeded the model's context window (input + requested output). " +
+            "The host's overflow recovery will attempt a compaction; if its whole-span summary is itself " +
+            "rejected, pi-vigilant's bounded-slice fallback takes over automatically.",
+          "warning",
+        );
+        // No continuation (re-queuing the same overflowing request is strictly
+        // self-reinforcing) and no compact here: the agent_end emission is not
+        // awaited by the agent loop, so a compact started here would race the
+        // host's own overflow recovery (which runs right after agent_end) and
+        // could outlive the session. Instead the host's recovery runs, fails
+        // (its whole-span summary is itself rejected when the span is at the
+        // limit), and the session_compact_failed handler below arms the
+        // fallback and triggers the retry compact — awaited, so it cannot race.
+        return;
+      }
+
       if (!shouldQueueFailureContinuation(assistant)) return;
       state.continuationSinceLastVerification = true;
       try {
@@ -2849,14 +2999,26 @@ export default function (pi: ExtensionAPI): void {
   // fallback engage for a reason the user chose.
   pi.on(
     "session_compact_failed",
-    (event: SessionCompactFailedEvent, ctx: ExtensionContext) => {
+    async (event: SessionCompactFailedEvent, ctx: ExtensionContext) => {
+      let ctxOk = "?";
+      try { ctxOk = String(!!ctx.modelRegistry); } catch (e) { ctxOk = "STALE:" + (e as Error).message.slice(0, 40); }
       if (!config.compactionFallback) return;
       if (event.aborted) return;
 
       state.consecutiveCompactionFailures++;
+
+      // The host's overflow recovery is a dead end: it summarizes the whole
+      // span in one request, which is itself rejected when the span is at the
+      // limit, and it gives up after one attempt per turn. So an overflow
+      // failure arms the fallback immediately (bypassing the general
+      // 2-failure threshold) and triggers the retry compact right here — the
+      // only path that can recover the session.
+      const overflowDeadEnd = event.reason === "overflow";
+
       if (
+        !overflowDeadEnd &&
         state.consecutiveCompactionFailures <
-        config.compactionFallbackAfterFailures
+          config.compactionFallbackAfterFailures
       ) {
         return;
       }
@@ -2888,9 +3050,11 @@ export default function (pi: ExtensionAPI): void {
         );
       }
 
-      // Deliberately no ctx.compact() here: Pi's own retry and overflow paths
-      // re-enter compaction on their own, and triggering it ourselves would race
-      // any other extension that hooks the same event.
+      // No ctx.compact() here: it cannot run during the run loop — its abort()
+      // waits for the session to become idle, which only happens after the run
+      // loop exits, so it would deadlock (and the handler is awaited by the
+      // loop). The retry happens in the agent_settled handler, where the
+      // session is idle and not yet disposed.
     },
   );
 
@@ -2898,6 +3062,10 @@ export default function (pi: ExtensionAPI): void {
   pi.on(
     "session_before_compact",
     async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
+      try {
+      } catch (e) {
+        return;
+      }
       if (!config.compactionFallback) return;
       // Dormant: while compaction is working, Pi's own path stays in charge.
       if (!state.compactionFallbackArmed) return;
@@ -2933,12 +3101,15 @@ export default function (pi: ExtensionAPI): void {
         };
       } catch (error) {
         // Fail fast and say so once. Retrying a dead provider just burns tokens.
-        ctx.ui.notify(
-          `pi-vigilant's compaction fallback could not summarize the context: ` +
-            `${error instanceof Error ? error.message : String(error)}. ` +
-            `The session may not be able to continue — check the provider, then run /compact manually.`,
-          "error",
-        );
+        try {
+          ctx.ui.notify(
+            `pi-vigilant's compaction fallback could not summarize the context: ` +
+              `${error instanceof Error ? error.message : String(error)}. ` +
+              `The session may not be able to continue — check the provider, then run /compact manually.`,
+            "error",
+          );
+        } catch (e2) {
+        }
         return;
       } finally {
         state.compactionFallbackActive = false;
@@ -2951,8 +3122,81 @@ export default function (pi: ExtensionAPI): void {
   // continuations, send a targeted check based on past feedback.
   // Only fires when the last task was non-trivial (had tool calls).
   // Simple Q&A (0 tool calls) passes through silently.
-  pi.on("agent_settled", () => {
+  pi.on("agent_settled", async (_event: unknown, ctx: ExtensionContext) => {
+    // ── Overflow recovery: retry the compaction now that the session is idle ──
+    // The host's overflow recovery gave up (its whole-span summary is itself
+    // rejected when the span is at the limit) and the fallback is armed. A
+    // ctx.compact() cannot run during the run loop — its abort() waits for the
+    // session to become idle, which only happens after the loop exits, so it
+    // would deadlock. Here the session is idle and not yet disposed, so the
+    // compact can run; the handler blocks until it finishes (onComplete /
+    // onError), so the run cannot end while the compact is in flight. On
+    // success the continuation is queued with triggerTurn: true, which starts
+    // a new run that resumes the interrupted turn.
+    let overflowRetryRan = false;
+    if (
+      config.compactionFallback &&
+      state.compactionFallbackArmed &&
+      !state.compactionFallbackActive &&
+      !state.compactionFallbackExhausted &&
+      !state.overflowRetryInFlight &&
+      !state.overflowRetryBlocked &&
+      state.compactionFallbackAttempts <
+        config.maxCompactionFallbackAttempts
+    ) {
+      overflowRetryRan = true;
+      state.overflowRetryInFlight = true;
+      await new Promise<void>((resolve) => {
+        ctx.compact({
+          customInstructions:
+            "Compaction keeps failing because the span to summarize is too large for one request. " +
+            "Preserve the user's most recent request verbatim and the exact state of the in-flight work " +
+            "so it can be resumed immediately after this summary.",
+          onComplete: () => {
+            // The fallback summary succeeded — resume the interrupted turn.
+            state.overflowRetryQueued = true;
+            queueErrorResumeContinuation();
+            resolve();
+          },
+          onError: () => {
+            // The host emits session_compact_failed again; its handler
+            // (fresh ctx) counts it and stops at the attempt cap. No
+            // continuation was queued, so nothing will resume the run.
+            state.overflowRetryQueued = false;
+            resolve();
+          },
+        });
+      });
+      // The continuation is queued with triggerTurn: true, which starts a new
+      // run that resumes the interrupted turn. pi.sendMessage is fire-and-
+      // forget, so the run would be killed by the print mode's dispose the
+      // moment this handler returns. Block until the resumed run settles:
+      // its agent_settled (below) resolves this promise.
+      if (state.overflowRetryQueued) {
+        // The continuation is queued with triggerTurn: true, which starts a
+        // new run that resumes the interrupted turn. pi.sendMessage is fire-
+        // and-forget, so the run would be killed by the print mode's dispose
+        // the moment this handler returns. Block until the resumed run
+        // settles: its agent_settled (below) resolves this promise.
+        await new Promise<void>((resolve) => {
+          state.overflowRetryResume = resolve;
+        });
+      } else {
+        state.overflowRetryInFlight = false;
+      }
+    }
+
+    // A resumed run settles again: release the overflow retry's waiter and
+    // skip the retry (the compact already ran for this overflow).
+    if (state.overflowRetryResume) {
+      const resume = state.overflowRetryResume;
+      state.overflowRetryResume = null;
+      state.overflowRetryInFlight = false;
+      resume();
+    }
+
     if (!config.finalVerification) return;
+    if (overflowRetryRan) return; // The resumed run will settle again and verify.
     if (!state.lastResponseConclusive) return; // Already handled by other paths
 
     // ── Complexity gate: skip verification for simple Q&A ────────────
