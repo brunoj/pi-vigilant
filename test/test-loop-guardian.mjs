@@ -15,7 +15,8 @@ import { loadExtension } from "./harness.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.dirname(HERE);
-const EXT = path.join(REPO, "index.ts");
+const EXT = process.env.PV_EXT || path.join(REPO, "index.ts");
+const EXT_DIR = path.dirname(EXT);
 
 const results = [];
 function check(name, cond, detail = "") {
@@ -338,7 +339,7 @@ function extWithConfig(overrides = {}) {
   const dir = fs.mkdtempSync(path.join(base, ".tmp-loop-"));
   tempDirs.push(dir);
   fs.copyFileSync(EXT, path.join(dir, "index.ts"));
-  fs.cpSync(path.join(REPO, "lib"), path.join(dir, "lib"), { recursive: true });
+  fs.cpSync(path.join(EXT_DIR, "lib"), path.join(dir, "lib"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, "pi-vigilant.json"),
     JSON.stringify(
