@@ -57,26 +57,49 @@ summary is itself rejected — the two mechanisms compose: overflow error →
 compact → host summary fails → fallback arms → retry compact → fallback
 summary succeeds → continuation resumes the turn.
 
-## Tests (test/test-context-overflow.mjs)
+## Final design (shipped in 0.3.1)
 
-- Case 3 overflow (error message matches a provider pattern) → no
-  auto-continue-error queued, compact called, notify sent.
-- Case 3 overflow + compact onComplete → continuation queued (resume).
-- Case 3 overflow + compact onError → notify, no continuation.
-- Case 3 non-overflow error (e.g. "fetch failed") → continuation queued
-  (unchanged behavior).
-- Case 3 context-nearly-full (getContextUsage override) + non-overflow error →
-  compact instead of continuation.
-- Cap: second overflow in a streak → notify, no compact, no continuation.
-- Cooldown: overflow within 60s of a Case 1a compact → notify, no compact.
-- Length path unchanged (regression: Case 1a still compacts; Case 1 overflow
-  still defers).
-- Live E2E: proxy returns the exact 400 overflow error → assert compact +
-  resume; then proxy accepts → turn completes. Negative: transient error →
-  continuation (unchanged).
+The compact cannot run from `agent_end` (the emission is fire-and-forget and
+races the host's overflow recovery → stale ctx) and cannot run from inside the
+run loop (`ctx.compact()` → `abort()` → `waitForIdle()` deadlocks while
+`_isAgentRunActive` is true). The retry therefore runs from `agent_settled`:
+
+1. `agent_end` (overflow) → notify + return. No continuation (self-reinforcing),
+   no compact (races the host).
+2. Host's overflow recovery → `session_before_compact` (reason=overflow) →
+   whole-span summary rejected → `session_compact_failed` (reason=overflow).
+3. `session_compact_failed` handler arms the bounded-slice fallback immediately
+   (overflow bypasses the general 2-failure threshold) and notifies.
+4. `agent_settled` (session idle, not yet disposed) → retry compact. The
+   handler blocks on the callbacks; on success it queues the continuation with
+   `triggerTurn: true` (starts a new run) and blocks until that run's own
+   `agent_settled` releases it — so the print mode cannot dispose the session
+   mid-run. On failure it returns (the host's `session_compact_failed` counts
+   it; the operator was already notified when the fallback armed).
+5. The cap/cooldown (`maxContextPressureCompactions`, 60s cooldown) set
+   `overflowRetryBlocked`, which gates the retry; a successful compact clears
+   it.
+
+## Tests (test/test-context-overflow.mjs, 32/32)
+
+- Overflow at agent_end → no continuation, no compact, notify (the core fix).
+- Overflow + successful retry compact → continuation queued (resume), fresh
+  run, epoch+runId on the continuation.
+- Overflow + failed retry compact → no continuation, no hang, operator
+  notified.
+- Non-overflow error → continuation queued (unchanged).
+- Context-nearly-full + non-overflow → no continuation, retry compacts.
+- Cap: second overflow → no second compact, no second continuation, warn.
+- Cooldown: overflow within 60s → no second compact, no second continuation,
+  warn.
+- Length path unchanged (regression: Case 1a still compacts).
+- Disabled (`contextPressureCompaction: false`) → continuation (unchanged).
+- Live E2E (proxy rejects the exact 400 overflow + the host's whole-span
+  summary): positive → `E2E_OK`, turn resumed, exit 0; negative (all summaries
+  rejected) → no hang, no deadlock, exit 0.
 
 ## Release
 
-0.3.1 (patch): test suite green → live E2E green → version + CHANGELOG +
-annotated tag → push + publish → verify published artifact → update local
-install.
+0.3.1 (patch): test suite green (263/263) → live E2E green (positive +
+negative) → version + CHANGELOG + annotated tag → push + publish → verify
+published artifact (32/32 via PV_EXT) → update local install.
