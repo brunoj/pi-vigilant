@@ -31,6 +31,7 @@ export async function loadExtension(extPath, { agentDir } = {}) {
 
   const handlers = new Map();
   const sent = [];
+  const userMessages = [];
   const tools = new Map();
   const commands = new Map();
   const compacted = [];
@@ -50,7 +51,13 @@ export async function loadExtension(extPath, { agentDir } = {}) {
       if (opts?.deliverAs === "followUp") queue.followUp.push(msg);
       else if (opts?.deliverAs === "steer") queue.steering.push(msg);
     },
-    sendUserMessage() {},
+    sendUserMessage(content, opts) {
+      userMessages.push({ content, opts, at: Date.now() });
+      // Simulate host behaviour: while streaming, steer goes to the steering
+      // queue (injected into the current turn), followUp to the follow-up queue.
+      if (opts?.deliverAs === "steer") queue.steering.push({ role: "user", content });
+      else if (opts?.deliverAs === "followUp") queue.followUp.push({ role: "user", content });
+    },
     registerTool(t) { tools.set(t.name, t); },
     registerCommand(name, c) { commands.set(name, c); },
     registerEntryRenderer() {},
@@ -100,7 +107,7 @@ export async function loadExtension(extPath, { agentDir } = {}) {
     return results;
   }
 
-  return { pi, emit, sent, tools, commands, queue, handlers, compacted, notifications };
+  return { pi, emit, sent, userMessages, tools, commands, queue, handlers, compacted, notifications };
 }
 
 /** Build an assistant message with a given stopReason and text. */

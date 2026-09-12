@@ -58,6 +58,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { LoopGuardian, type LoopGuardianConfig } from "./lib/loop-guardian";
 
 /**
  * `session_compact_failed` payload. Declared locally because the host's root
@@ -151,6 +152,29 @@ interface ExtensionConfig {
   maxCompactionFallbackChunks: number;
   /** Optional `provider/modelId` (or bare model id) to summarize with. */
   compactionFallbackModel?: string;
+  /**
+   * Loop Guardian: detect an agent stuck in an endless loop (identical repeated
+   * tool calls, cyclic tool-call sequences, or an analysis stall) and steer it
+   * out with a user-role message — the same mechanism as the user typing
+   * "YOU ARE LOOPING ENDLESSLY! STOP THAT AND START IMPLEMENTING IMMEDIATELY".
+   */
+  loopGuardian: boolean;
+  /** D1: identical (tool, args, result) repeats before firing. */
+  loopRepeatThreshold: number;
+  /** D2: full passes of the cycle required. */
+  loopCycleRepeats: number;
+  /** D2: maximum cycle period p. */
+  loopMaxCycleLength: number;
+  /** Number of recent calls to remember. */
+  loopWindowSize: number;
+  /** D3: no-mutation budget (clamped to loopWindowSize). */
+  loopStallCalls: number;
+  /** D3: minimum fraction of repeated results in the stall window. */
+  loopStallRepeatRatio: number;
+  /** Steers before the operator is notified (then silence). */
+  loopSteerMax: number;
+  /** Minimum gap between interventions, in ms. */
+  loopCooldownMs: number;
 }
 
 function loadConfig(): ExtensionConfig {
@@ -218,6 +242,39 @@ function loadConfig(): ExtensionConfig {
           DEFAULT_MAX_COMPACTION_FALLBACK_CHUNKS,
         ),
         compactionFallbackModel: normalizeModelRef(parsed.compactionFallbackModel),
+        loopGuardian: parsed.loopGuardian !== false,
+        loopRepeatThreshold: normalizeCount(
+          parsed.loopRepeatThreshold,
+          DEFAULT_LOOP_REPEAT_THRESHOLD,
+        ),
+        loopCycleRepeats: normalizeCount(
+          parsed.loopCycleRepeats,
+          DEFAULT_LOOP_CYCLE_REPEATS,
+        ),
+        loopMaxCycleLength: normalizeCount(
+          parsed.loopMaxCycleLength,
+          DEFAULT_LOOP_MAX_CYCLE_LENGTH,
+        ),
+        loopWindowSize: normalizeCount(
+          parsed.loopWindowSize,
+          DEFAULT_LOOP_WINDOW_SIZE,
+        ),
+        loopStallCalls: normalizeCount(
+          parsed.loopStallCalls,
+          DEFAULT_LOOP_STALL_CALLS,
+        ),
+        loopStallRepeatRatio: normalizeRatio(
+          parsed.loopStallRepeatRatio,
+          DEFAULT_LOOP_STALL_REPEAT_RATIO,
+        ),
+        loopSteerMax: normalizeCount(
+          parsed.loopSteerMax,
+          DEFAULT_LOOP_STEER_MAX,
+        ),
+        loopCooldownMs: normalizeCount(
+          parsed.loopCooldownMs,
+          DEFAULT_LOOP_COOLDOWN_MS,
+        ),
       };
     }
   } catch {
@@ -247,6 +304,15 @@ function loadConfig(): ExtensionConfig {
     compactionFallbackChunkTokens: DEFAULT_COMPACTION_FALLBACK_CHUNK_TOKENS,
     maxCompactionFallbackChunks: DEFAULT_MAX_COMPACTION_FALLBACK_CHUNKS,
     compactionFallbackModel: undefined,
+    loopGuardian: true,
+    loopRepeatThreshold: DEFAULT_LOOP_REPEAT_THRESHOLD,
+    loopCycleRepeats: DEFAULT_LOOP_CYCLE_REPEATS,
+    loopMaxCycleLength: DEFAULT_LOOP_MAX_CYCLE_LENGTH,
+    loopWindowSize: DEFAULT_LOOP_WINDOW_SIZE,
+    loopStallCalls: DEFAULT_LOOP_STALL_CALLS,
+    loopStallRepeatRatio: DEFAULT_LOOP_STALL_REPEAT_RATIO,
+    loopSteerMax: DEFAULT_LOOP_STEER_MAX,
+    loopCooldownMs: DEFAULT_LOOP_COOLDOWN_MS,
   };
 }
 
@@ -321,6 +387,20 @@ const TURN_PREFIX_INSTRUCTIONS =
   "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained. " +
   "Summarize the prefix so the retained suffix stays understandable: the original request, " +
   "early progress, and the context needed to read the kept suffix.";
+
+// ---------------------------------------------------------------------------
+// Loop Guardian defaults
+// ---------------------------------------------------------------------------
+
+const DEFAULT_LOOP_REPEAT_THRESHOLD = 3;
+const DEFAULT_LOOP_CYCLE_REPEATS = 2;
+const DEFAULT_LOOP_MAX_CYCLE_LENGTH = 32;
+// Must hold at least 2 full passes of the longest cycle (maxCycleLength * cycleRepeats).
+const DEFAULT_LOOP_WINDOW_SIZE = 64;
+const DEFAULT_LOOP_STALL_CALLS = 24;
+const DEFAULT_LOOP_STALL_REPEAT_RATIO = 0.5;
+const DEFAULT_LOOP_STEER_MAX = 2;
+const DEFAULT_LOOP_COOLDOWN_MS = 90_000;
 
 /**
  * customTypes this extension queues. The context filter only ever considers
@@ -998,6 +1078,85 @@ export default function (pi: ExtensionAPI): void {
     currentTaskPath: undefined,
     currentTaskTitle: undefined,
   };
+
+  // ======================================================================
+  // LOOP GUARDIAN
+  //
+  // Detects an agent stuck in an endless loop — identical repeated tool calls,
+  // cyclic tool-call sequences ("returns from its tail to its head"), or an
+  // analysis stall — and steers it out with a real user-role message, the same
+  // mechanism as the user typing "YOU ARE LOOPING ENDLESSLY! STOP THAT AND
+  // START IMPLEMENTING IMMEDIATELY". Escalates: steer 1 → steer 2 → one
+  // operator notification. Never blocks.
+  // ======================================================================
+
+  const loopGuardian = new LoopGuardian({
+    config: {
+      repeatThreshold: config.loopRepeatThreshold,
+      cycleRepeats: config.loopCycleRepeats,
+      maxCycleLength: config.loopMaxCycleLength,
+      windowSize: config.loopWindowSize,
+      stallCalls: config.loopStallCalls,
+      stallRepeatRatio: config.loopStallRepeatRatio,
+      steerMax: config.loopSteerMax,
+      cooldownMs: config.loopCooldownMs,
+    },
+  });
+
+  // toolCallId → args, for correlating tool_execution_end with its start.
+  const loopToolArgs = new Map<string, unknown>();
+
+  pi.on(
+    "tool_execution_start",
+    (event: { toolCallId: string; args: unknown }) => {
+      loopToolArgs.set(event.toolCallId, event.args);
+    },
+  );
+
+  pi.on(
+    "tool_execution_end",
+    (
+      event: {
+        toolCallId: string;
+        toolName: string;
+        result: unknown;
+        isError: boolean;
+      },
+      ctx: ExtensionContext,
+    ) => {
+      if (!config.loopGuardian) return;
+      const args = loopToolArgs.get(event.toolCallId) ?? {};
+      loopToolArgs.delete(event.toolCallId);
+      const action = loopGuardian.recordToolCall(
+        event.toolName,
+        args,
+        event.result,
+        event.isError,
+      );
+      if (!action) return;
+      if (action.action === "steer") {
+        try {
+          pi.sendUserMessage(action.message, { deliverAs: "steer" });
+        } catch {
+          // Agent may be in a state that rejects messages
+        }
+      } else {
+        ctx.ui.notify(action.message, "warning");
+      }
+    },
+  );
+
+  // A genuine user message starts a new episode; extension-sourced input
+  // (auto-continue, our own steer) must not.
+  pi.on("input", (event: { source: string }) => {
+    if (event.source === "extension") return;
+    loopGuardian.reset();
+  });
+
+  // A model change or a compaction changes the context: re-derivation is
+  // recovery, not a loop.
+  pi.on("model_select", () => loopGuardian.reset());
+  pi.on("session_compact", () => loopGuardian.reset());
 
   // ======================================================================
   // FEEDBACK MEMORY TOOLS

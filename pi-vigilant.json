@@ -22,5 +22,15 @@
   "maxCompactionFallbackAttempts": 3,
   "compactionFallbackChunkTokens": 8192,
   "maxCompactionFallbackChunks": 6,
-  "compactionFallbackModel": ""
+  "compactionFallbackModel": "",
+  "loopGuardianComment": "Loop Guardian: detects an agent stuck in an endless loop (identical repeated tool calls, cyclic call sequences, or an analysis stall with no file modification) and steers it out with a user-role message, escalating steer 1 -> steer 2 -> one operator notification. It never hard-blocks; a false positive costs one message. loopWindowSize must hold two full passes of the longest cycle (maxCycleLength * cycleRepeats). Text-only loops are out of scope.",
+  "loopGuardian": true,
+  "loopRepeatThreshold": 3,
+  "loopCycleRepeats": 2,
+  "loopMaxCycleLength": 32,
+  "loopWindowSize": 64,
+  "loopStallCalls": 24,
+  "loopStallRepeatRatio": 0.5,
+  "loopSteerMax": 2,
+  "loopCooldownMs": 90000
 }

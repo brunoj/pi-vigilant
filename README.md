@@ -63,7 +63,17 @@ Run `/reload` (or restart pi) after installing.
   "maxCompactionFallbackAttempts": 3,
   "compactionFallbackChunkTokens": 8192,
   "maxCompactionFallbackChunks": 6,
-  "compactionFallbackModel": ""
+  "compactionFallbackModel": "",
+
+  "loopGuardian": true,
+  "loopRepeatThreshold": 3,
+  "loopCycleRepeats": 2,
+  "loopMaxCycleLength": 32,
+  "loopWindowSize": 64,
+  "loopStallCalls": 24,
+  "loopStallRepeatRatio": 0.5,
+  "loopSteerMax": 2,
+  "loopCooldownMs": 90000
 }
 ```
 
@@ -210,3 +220,40 @@ Ownership rules that keep it safe:
   with a different model than the session uses — useful when the session model
   cannot take the span but another configured model can. Empty means the session
   model.
+
+## Loop Guardian
+
+An agent stuck in an endless loop — re-running the same analysis, returning from
+the tail of a task to its head, never taking the next concrete step — burns
+tokens and never finishes. The Loop Guardian detects that state and steers the
+agent out of it, the same way a human would.
+
+Detection (all signatures require the **result to be identical too**, not just
+the call — polling loops whose results change are legitimate and never fire):
+
+- **Identical repeat** — the same tool call (canonical arguments + result) seen
+  `loopRepeatThreshold` (default 3) times within the window.
+- **Cycle** — the last `loopCycleRepeats` (default 2) passes of a period-`p`
+  sequence are byte-identical (the "tail → head" case). Periods up to
+  `loopMaxCycleLength` (default 32) are checked; `loopWindowSize` (default 64)
+  must hold two full passes.
+- **Analysis stall** — `loopStallCalls` (default 24) consecutive calls with no
+  file modification and at least `loopStallRepeatRatio` (default 0.5) repeated
+  results (low information gain). First-pass research that reads new files
+  never fires.
+
+Intervention is a real user-role steering message injected into the current
+turn (`sendUserMessage` with `deliverAs: "steer"`) — the faithful reproduction
+of a human typing "YOU ARE LOOPING ENDLESSLY! STOP THAT AND START IMPLEMENTING
+IMMEDIATELY". It never hard-blocks: a false positive costs one message, not a
+halted run.
+
+- Escalation: steer 1 (names the repeated pattern) → steer 2 (stronger) → one
+  operator notification (`loopSteerMax`, default 2 steers; then silence).
+- `loopCooldownMs` (default 90000) suppresses repeat detections of the same
+  episode; after a steer the window is cleared, so only *new* looping escalates.
+- Progress resets the episode: any write/edit tool, new result, genuine user
+  input, model change, or compaction. Auto-continue (extension-sourced input)
+  does **not** reset — it is the same task.
+- `loopGuardian: false` disables the whole mechanism.
+- Text-only loops (no tool calls) are out of scope for v1.

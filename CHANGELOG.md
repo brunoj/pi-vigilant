@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-12
+
+### Added
+
+- **Loop Guardian** — detects an agent stuck in an endless loop and steers it
+  out. Three detectors, all requiring the *result* to be identical too (polling
+  loops whose results change are legitimate and never fire):
+
+  - **Identical repeat** — the same tool call (canonical args + result) seen
+    `loopRepeatThreshold` (default 3) times within the window.
+  - **Cycle** — the last `loopCycleRepeats` (default 2) passes of a period-`p`
+    sequence are identical (the "tail → head" case); periods up to
+    `loopMaxCycleLength` (default 32).
+  - **Analysis stall** — `loopStallCalls` (default 24) consecutive calls with no
+    file modification and ≥ `loopStallRepeatRatio` (default 0.5) repeated
+    results.
+
+  Intervention is a real user-role steering message injected into the current
+  turn (`sendUserMessage` with `deliverAs: "steer"`) — the faithful reproduction
+  of a human typing "YOU ARE LOOPING ENDLESSLY! STOP THAT AND START
+  IMPLEMENTING IMMEDIATELY". It never hard-blocks: a false positive costs one
+  message, not a halted run. Escalation: steer 1 → steer 2 → one operator
+  notification (`loopSteerMax`, default 2), with `loopCooldownMs` (default
+  90000) suppressing repeat detections of the same episode. Progress resets the
+  episode: any write/edit tool, new result, genuine user input, model change,
+  or compaction. Auto-continue (extension-sourced input) does **not** reset.
+  `loopGuardian: false` disables the whole mechanism. Text-only loops are out
+  of scope for v1. Pure logic lives in `lib/loop-guardian.ts` (now shipped in
+  the package).
+
 ## [0.2.0] - 2026-09-11
 
 ### Added

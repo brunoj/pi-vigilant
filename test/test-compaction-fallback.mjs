@@ -172,6 +172,7 @@ function extWithConfig(overrides = {}) {
   const dir = fs.mkdtempSync(path.join(base, ".tmp-compact-"));
   tempDirs.push(dir);
   fs.copyFileSync(EXT, path.join(dir, "index.ts"));
+  fs.cpSync(path.join(REPO, "lib"), path.join(dir, "lib"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, "pi-vigilant.json"),
     JSON.stringify(
