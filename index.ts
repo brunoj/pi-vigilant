@@ -2455,28 +2455,45 @@ export default function (pi: ExtensionAPI): void {
     let summary = preparation.previousSummary;
     let usage: SummarizationUsage | undefined;
     let chunks = 0;
-    for (const slice of used) {
-      const result = await generateSummaryWithUsage(
-        slice.messages,
-        model,
-        reserveTokens,
-        auth.apiKey,
-        auth.headers,
-        signal,
-        customInstructions,
-        summary,
-        ctx.thinkingLevel,
-        undefined,
-        auth.env,
-      );
-      summary = result.text;
-      usage = combineUsage(usage, result.usage);
-      chunks++;
+    let coveredTokens = 0;
+    let foldComplete = complete;
+    try {
+      for (const slice of used) {
+        const result = await generateSummaryWithUsage(
+          slice.messages,
+          model,
+          reserveTokens,
+          auth.apiKey,
+          auth.headers,
+          signal,
+          customInstructions,
+          summary,
+          ctx.thinkingLevel,
+          undefined,
+          auth.env,
+        );
+        summary = result.text;
+        usage = combineUsage(usage, result.usage);
+        chunks++;
+        coveredTokens += slice.tokens;
+      }
+    } catch (error) {
+      // A slice failed — provider error, or the summary generation hit the
+      // output token cap (stopReason "length": the summary is incomplete).
+      // Fail fast: do not iterate the remaining slices. But when at least one
+      // slice was already summarized, fall back to Mechanism B (prefix cut)
+      // instead of failing the whole compaction — the summary covers the
+      // successfully summarized prefix and the cut moves to the end of it, so
+      // nothing is discarded that the summary never saw. This is the "fails
+      // partway" branch of the Mechanism B spec: a partial compaction must
+      // always be possible once any slice succeeded.
+      if (chunks === 0) throw error;
+      foldComplete = false;
     }
 
     // The turn prefix is only replaced when the cut point moves past it, i.e.
     // when the fold covered the whole span.
-    if (complete && hasTurnPrefix) {
+    if (foldComplete && hasTurnPrefix) {
       const result = await generateSummaryWithUsage(
         turnPrefix,
         model,
@@ -2499,9 +2516,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (!summary) return undefined;
 
-    const coveredTokens = used.reduce((sum, slice) => sum + slice.tokens, 0);
-
-    if (complete) {
+    if (foldComplete) {
       return {
         summary,
         firstKeptEntryId: preparation.firstKeptEntryId,
@@ -2525,7 +2540,7 @@ export default function (pi: ExtensionAPI): void {
     // prefix and move the cut to the end of it, so nothing is discarded that the
     // summary never saw. Aim for half the span, which is the most a partial
     // compaction should ever take.
-    const summarizedTokens = foldedTokens;
+    const summarizedTokens = coveredTokens;
     const cut = findPrefixCut(
       spanEntries(event.branchEntries, preparation),
       Math.min(summarizedTokens, targetTokens),

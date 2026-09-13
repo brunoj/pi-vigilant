@@ -463,6 +463,40 @@ section("10. a failing summarizer fails fast, once");
   clearSummarizer();
 }
 
+section("10b. a slice failing partway still yields a partial compaction");
+{
+  const h = await load({ compactionFallbackChunkTokens: 1024, maxCompactionFallbackChunks: 6 });
+  // Slice 1 succeeds; slice 2 hits the output token cap (the exact host error:
+  // stopReason "length" — the summary is incomplete).
+  const calls = installSummarizer((_record, n) => {
+    if (n === 2) {
+      throw new Error(
+        "Summarization failed: generation hit the token cap and the summary is incomplete",
+      );
+    }
+    return { text: `summary-${n}`, usage: usageOf(100, 20) };
+  });
+  await failCompaction(h, 2);
+
+  const entries = buildSession({ count: 5, tokensEach: 1024 });
+  const event = compactEvent(entries);
+  const compaction = compactionOf(await h.emit(event));
+
+  check("a partial compaction is still returned (progress, not a stuck session)", Boolean(compaction));
+  check("the mechanism is recorded as a prefix cut", compaction?.details?.mechanism === "prefix-cut");
+  check("the fold stopped at the failing slice (fail fast)", calls.length === 2, `${calls.length} calls`);
+  check("the summary covers the successful prefix", compaction?.summary === "summary-1");
+  check(
+    "the cut point moves forward, away from the host's",
+    compaction?.firstKeptEntryId !== event.preparation.firstKeptEntryId,
+  );
+  check(
+    "no operator error about a stuck session",
+    !h.notifications.some((n) => /could not summarize/.test(n.message)),
+  );
+  clearSummarizer();
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // 11 — attempt cap
 // ════════════════════════════════════════════════════════════════════════

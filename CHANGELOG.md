@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-12
+
+### Fixed
+- The compaction fallback no longer fails the whole compaction when a slice
+  fails partway (provider error, or the summary generation hit the output
+  token cap — `stopReason "length"`). It now falls back to Mechanism B
+  (prefix cut): the summary covers the successfully summarized prefix and the
+  cut point moves to the end of it, so a partial compaction is always
+  possible once any slice succeeded. Previously a single length-capped slice
+  surfaced the operator error "could not summarize the context … run /compact
+  manually" even though a partial compaction was possible.
+
 ## [0.3.1] - 2026-09-12
 
 ### Fixed
