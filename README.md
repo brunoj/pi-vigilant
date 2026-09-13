@@ -64,6 +64,7 @@ Run `/reload` (or restart pi) after installing.
   "compactionFallbackChunkTokens": 8192,
   "maxCompactionFallbackChunks": 6,
   "compactionFallbackModel": "",
+  "compactionFallbackDropOnly": true,
 
   "loopGuardian": true,
   "loopRepeatThreshold": 3,
@@ -187,24 +188,48 @@ never compact — it is stuck, and the only exit is a new session.
 The fallback keeps that from being fatal. It stays dormant until compaction has
 actually failed (`compactionFallbackAfterFailures`, default 2, counted on
 consecutive non-aborted failures), then summarizes the span itself in
-size-bounded slices and hands the host a compaction it accepts:
+size-bounded slices and hands the host a compaction it accepts. It is a ladder —
+each rung is tried before the next, less destructive one gives way to a more
+destructive one, and the last rung always works:
 
 - **Chunked fold** — the span is split into slices of at most
   `compactionFallbackChunkTokens` (default 8192) estimated tokens, each
   summarized in its own request, chained forward through the previous summary so
   the result is one summary, not a pile of fragments. Nothing is dropped: the
   summary covers the whole span, so the host's own cut point is kept.
+- **Split and retry** — a slice whose summary hits the output token cap
+  ("generation hit the token cap and the summary is incomplete") or is rejected
+  as too long for the input is halved and retried, recursively down to the
+  minimum slice size, folding the halves forward. A size limit never fails the
+  compaction; only a genuinely broken provider does.
 - **Prefix cut** — when the span needs more slices than
-  `maxCompactionFallbackChunks` (default 6) allows, the fold summarizes a prefix
-  (about half the span by size) and moves the cut point to the end of what the
-  summary actually saw. That is a real reduction in fidelity — the kept messages
-  and the summary overlap less than they would otherwise — but the context
-  always shrinks, and the next compaction usually fits again.
+  `maxCompactionFallbackChunks` (default 6) allows, or a slice fails after
+  earlier ones succeeded, the fold summarizes a prefix (about half the span by
+  size) and moves the cut point to the end of what the summary actually saw.
+  That is a real reduction in fidelity — the kept messages and the summary
+  overlap less than they would otherwise — but the context always shrinks, and
+  the next compaction usually fits again.
+- **Drop-only (last resort)** — when no slice can be summarized at all
+  (provider down, every request rejected, even the smallest slice capped), the
+  oldest part of the span is dropped without a summary and the cut point moves
+  to ~half the span. No model call is involved, so this works while every
+  provider request fails. The summary entry says plainly that earlier context
+  was dropped; the operator is warned. Disable with
+  `compactionFallbackDropOnly: false` if you would rather be told to run
+  `/compact` manually than lose context.
+
+The recent tail is never touched. Pi's cut point is the boundary of the last
+`keepRecentTokens` — everything from there on is kept verbatim — and every
+mechanism above only ever moves the cut *earlier*, never past it. A partial
+compaction therefore keeps strictly more than the standard compactor would; it
+never summarizes or drops the messages Pi itself would have kept.
 
 The slice size adapts to the model: it is raised to cover the span within the
-chunk budget when the window allows, and clamped to what the model can actually
-accept when it does not. Every request stays bounded, which is the property Pi's
-single whole-span request does not have.
+chunk budget when the window allows, and clamped both to what the model can
+accept as input (`contextWindow - output budget - slack`) and to what its
+summary output can hold (`maxTokens`). A slice larger than the output budget is
+exactly the request that comes back length-capped, so the clamp is what keeps
+the first attempt from failing in the first place.
 
 Ownership rules that keep it safe:
 
@@ -212,10 +237,14 @@ Ownership rules that keep it safe:
   asks for one, so it cannot race the host or double-compact.
 - Attempts are capped (`maxCompactionFallbackAttempts`, default 3). When the cap
   is reached the extension stops and says so instead of burning requests.
-- A provider outage is not recovered from: the first slice that fails ends the
-  attempt with one clear message. A fallback that retried a dead provider would
-  just be a slower way to stay stuck.
+- A provider outage does not dead-end the session: if the first slice cannot be
+  summarized, the drop-only rung removes the oldest part of the span so the
+  session can continue once the provider is back. Nothing in this path calls the
+  model, so it cannot itself fail the way a summarization request can.
 - `compactionFallback: false` disables the whole mechanism.
+- `compactionFallbackDropOnly: false` keeps the fallback from dropping content
+  without a summary: if summarization is impossible, it reports the failure and
+  leaves the host path alone.
 - `compactionFallbackModel` (e.g. `"anthropic/claude-sonnet-4-5"`) summarizes
   with a different model than the session uses — useful when the session model
   cannot take the span but another configured model can. Empty means the session

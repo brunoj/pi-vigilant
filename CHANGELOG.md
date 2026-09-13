@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-12
+
+### Added
+- **The compaction fallback can no longer dead-end.** When every
+  summarization attempt fails — including the case where the provider rejects
+  or caps *every* request — the fallback now drops the oldest part of the
+  span (Mechanism C, "drop-only") and supplies a placeholder summary that
+  tells both the model and the operator that the earlier conversation is gone.
+  The operator error "pi-vigilant's compaction fallback could not summarize the
+  context … run /compact manually" is unreachable while drop-only is enabled.
+  Set `compactionFallbackDropOnly: false` to restore the old behaviour
+  (report the failure once and leave the host path alone).
+- **Split and retry.** A slice whose summary hits the output token cap is
+  split in half at a message boundary and both halves are summarized
+  recursively (depth ≤ 3, floor one chunk), folding the first half forward as
+  the second half's context. This turns a first-slice failure into a partial
+  or full compaction instead of an error.
+- `details.requests` on the fallback's compaction entries records how many
+  provider requests the fold actually spent, split retries included.
+
+### Fixed
+- **Slice sizing was blind to the summary output cap** — the root cause of
+  the reported first-slice failure: a ~150K-token span was sliced into
+  ~25K-token chunks to cover it in six requests, and the summary of such a
+  chunk hit the 11004-token output cap (`stopReason "length"`).
+  `planChunkTokens` now also bounds a slice by the summarization output budget
+  (`min(0.8 × reserveTokens, model.maxTokens)`), so a slice is small enough
+  that its summary can actually be produced. Previously only the *input*
+  window bounded a slice.
+- A compaction aborted by the user (`event.signal.aborted`) never drops or
+  summarizes content: the abort propagates to the host.
+- Every fallback cut point stays at or before the host's `firstKeptEntryId`,
+  so the most recent `keepRecentTokens` of conversation stay verbatim exactly
+  as the standard compactor keeps them. A split-turn prefix that the fold
+  never summarized is never cut into either.
+
 ## [0.3.2] - 2026-09-12
 
 ### Fixed

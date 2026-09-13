@@ -12,14 +12,20 @@
  *   4  successful compaction                     -> disarm + reset
  *   5  mechanism A (chunked fold)                -> host's cut point, full coverage
  *   6  chunking + folding                        -> one call per slice, folded in order
+ *  6b  output budget                           -> a slice never exceeds the summary cap
  *   7  chunk budget exceeded                     -> mechanism B (prefix cut)
  *   8  mechanism B cut point                     -> ~50% by size, legal cut point
  *   9  coverage                                  -> nothing dropped unsummarized
- *  10  summarizer failure                       -> fail fast, one message, no retry
+ *  10  summarizer failure                       -> no retry, drop-only keeps the session alive
+ * 10a  drop-only disabled                      -> fail fast, one message, no retry
+ * 10b  slice fails partway                     -> partial compaction (prefix cut)
+ * 10c  slice too large for one request         -> split in half, folded, complete
+ * 10d  every slice size hits the cap           -> drop-only last resort
+ * 10e  aborted compaction                      -> never drops content
  *  11  attempt cap                              -> refuses, says so, never loops
  *  12  config disabled                          -> hook never intervenes
  *  13  split turn                               -> turn prefix folded + merged
- *  14  usage                                    -> propagated into the compaction
+ * 13b  split turn, partial compaction           -> the turn prefix is never cut into
  *  15  config parsing                           -> values honoured, garbage ignored
  *  16  compactionFallbackModel                  -> summarizer uses that model
  *  17  ownership                                -> no ctx.compact(), one result/event
@@ -350,6 +356,35 @@ section("6. chunking folds forward, one request per slice");
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// 6b — the output budget bounds a slice
+// ════════════════════════════════════════════════════════════════════════
+section("6b. a slice never exceeds the summary output budget");
+{
+  const h = await load({ maxCompactionFallbackChunks: 1, compactionFallbackChunkTokens: 8192 });
+  const calls = installSummarizer();
+  await failCompaction(h, 2);
+
+  // The harness model: contextWindow 200000, maxTokens 32000, reserve 16384 →
+  // the host asks for min(0.8 * 16384, 32000) = 13107 output tokens. The even
+  // share would be 20480 tokens per slice (span / budget); the output budget
+  // must win, or the summary of that slice hits the token cap.
+  const entries = buildSession({ count: 20, tokensEach: 1024 });
+  await h.emit(compactEvent(entries));
+
+  check(
+    "no slice is larger than the summary output budget",
+    calls.length > 0 && calls.every((call) => call.tokens <= 13107),
+    `max ${Math.max(...calls.map((call) => call.tokens))}`,
+  );
+  check(
+    "the slice is still larger than the configured chunk size (the span is covered)",
+    calls[0]?.tokens > 8192,
+    String(calls[0]?.tokens),
+  );
+  clearSummarizer();
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // 7 + 8 + 9 — mechanism B
 // ════════════════════════════════════════════════════════════════════════
 section("7-9. mechanism B — prefix cut when the span exceeds the chunk budget");
@@ -438,9 +473,9 @@ section("7b. a cut point is never placed on a tool result");
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// 10 — provider failure: fail fast
+// 10 — provider failure: no retry, but the session still continues
 // ════════════════════════════════════════════════════════════════════════
-section("10. a failing summarizer fails fast, once");
+section("10. a failing summarizer is not retried — and the session still continues");
 {
   const h = await load({ compactionFallbackChunkTokens: 1024 });
   const calls = installSummarizer(() => {
@@ -449,10 +484,50 @@ section("10. a failing summarizer fails fast, once");
   await failCompaction(h, 2);
   const before = h.notifications.length;
 
-  const out = await h.emit(compactEvent(buildSession({ count: 5, tokensEach: 1024 })));
+  const entries = buildSession({ count: 5, tokensEach: 1024 });
+  const event = compactEvent(entries);
+  const out = await h.emit(event);
+  const compaction = compactionOf(out);
 
   check("the failure is not retried across slices", calls.length === 1, `${calls.length} calls`);
+  check("a compaction is still returned (the session can continue)", Boolean(compaction));
+  check(
+    "the mechanism is recorded as a drop-only compaction",
+    compaction?.details?.mechanism === "drop-only",
+    String(compaction?.details?.mechanism),
+  );
+  check(
+    "the cut point moves forward, away from the host's",
+    compaction?.firstKeptEntryId !== event.preparation.firstKeptEntryId,
+  );
+  check(
+    "the summary says the earlier context was dropped, not summarized",
+    /could not be summarized/.test(compaction?.summary ?? "") &&
+      /dropped without a summary/.test(compaction?.summary ?? ""),
+  );
+  check("exactly one message is shown", h.notifications.length - before === 1, `${h.notifications.length - before}`);
+  check(
+    "the message says what happened and that the session can continue",
+    /could not summarize/.test(h.notifications.at(-1)?.message ?? "") &&
+      /dropped the oldest part/.test(h.notifications.at(-1)?.message ?? "") &&
+      h.notifications.at(-1)?.type === "warning",
+  );
+  clearSummarizer();
+}
+
+section("10a. compactionFallbackDropOnly:false — the failure is reported, not destructive");
+{
+  const h = await load({ compactionFallbackChunkTokens: 1024, compactionFallbackDropOnly: false });
+  const calls = installSummarizer(() => {
+    throw new Error("provider exploded");
+  });
+  await failCompaction(h, 2);
+  const before = h.notifications.length;
+
+  const out = await h.emit(compactEvent(buildSession({ count: 5, tokensEach: 1024 })));
+
   check("no compaction is returned (the host path is left alone)", out.every((r) => r === undefined));
+  check("the failure is still not retried", calls.length === 1, `${calls.length} calls`);
   check("exactly one message is shown", h.notifications.length - before === 1, `${h.notifications.length - before}`);
   check(
     "the message says what happened and what to do",
@@ -492,9 +567,206 @@ section("10b. a slice failing partway still yields a partial compaction");
   );
   check(
     "no operator error about a stuck session",
-    !h.notifications.some((n) => /could not summarize/.test(n.message)),
+    !h.notifications.some((n) => /may not be able to continue/.test(n.message)),
   );
   clearSummarizer();
+}
+
+section("10c. a slice too large for one request is split and retried");
+{
+  const h = await load({ compactionFallbackChunkTokens: 8192 });
+  // The first slice hits the output token cap; the two halves succeed. This is
+  // the exact failure shape the user hit: the summary of the slice is
+  // incomplete, but the context itself is fine to summarize in smaller parts.
+  const calls = installSummarizer((_record, n) => {
+    if (n === 1) {
+      throw new Error(
+        "Summarization failed: generation hit the token cap and the summary is incomplete",
+      );
+    }
+    return { text: `summary-${n}`, usage: usageOf(100, 20) };
+  });
+  await failCompaction(h, 2);
+
+  // Four 2048-token messages = one 8192-token slice.
+  const entries = buildSession({ count: 4, tokensEach: 2048 });
+  const event = compactEvent(entries);
+  const compaction = compactionOf(await h.emit(event));
+
+  check("the compaction succeeds after the split", Boolean(compaction));
+  check(
+    "the whole span is covered as one slice (mechanism A)",
+    compaction?.details?.mechanism === "chunked-fold" && compaction?.details?.chunks === 1,
+    `${compaction?.details?.mechanism}/${compaction?.details?.chunks}`,
+  );
+  check("the slice became two requests after the failure", calls.length === 3, `${calls.length} calls`);
+  check(
+    "the halves are smaller than the original slice",
+    calls[1]?.tokens < 8192 && calls[2]?.tokens < 8192,
+    `${calls[1]?.tokens}/${calls[2]?.tokens}`,
+  );
+  check(
+    "the second half folds the first half's summary forward",
+    calls[2]?.previousSummary === "summary-2",
+    String(calls[2]?.previousSummary),
+  );
+  check("the summary is the folded result", compaction?.summary === "summary-3");
+  check(
+    "the provider requests are counted for diagnostics",
+    compaction?.details?.requests === 3,
+    String(compaction?.details?.requests),
+  );
+  check(
+    "the host's own cut point is kept (nothing extra dropped)",
+    compaction?.firstKeptEntryId === event.preparation.firstKeptEntryId,
+  );
+  clearSummarizer();
+}
+
+section("10d. when even a split slice hits the cap, the oldest content is dropped");
+{
+  const h = await load({ compactionFallbackChunkTokens: 8192 });
+  const calls = installSummarizer(() => {
+    throw new Error(
+      "Summarization failed: generation hit the token cap and the summary is incomplete",
+    );
+  });
+  await failCompaction(h, 2);
+
+  const entries = buildSession({ count: 4, tokensEach: 2048 });
+  const event = compactEvent(entries);
+  const compaction = compactionOf(await h.emit(event));
+
+  check("a compaction is still returned (the session can continue)", Boolean(compaction));
+  check(
+    "the mechanism is recorded as a drop-only compaction",
+    compaction?.details?.mechanism === "drop-only",
+    String(compaction?.details?.mechanism),
+  );
+  check(
+    "the cut point moves forward, away from the host's",
+    compaction?.firstKeptEntryId !== event.preparation.firstKeptEntryId,
+  );
+  check(
+    "the split attempts are bounded (no request loop)",
+    calls.length >= 2 && calls.length <= 15,
+    `${calls.length} calls`,
+  );
+  check(
+    "the operator is warned about the drop",
+    h.notifications.at(-1)?.type === "warning" &&
+      /dropped the oldest part/.test(h.notifications.at(-1)?.message ?? ""),
+  );
+  check(
+    "no 'could not summarize' dead-end is raised",
+    !h.notifications.some((n) => /may not be able to continue/.test(n.message)),
+  );
+  clearSummarizer();
+}
+
+section("10e. an aborted compaction never drops content");
+{
+  const h = await load({ compactionFallbackChunkTokens: 1024 });
+  installSummarizer(() => {
+    throw new Error(
+      "Summarization failed: generation hit the token cap and the summary is incomplete",
+    );
+  });
+  await failCompaction(h, 2);
+
+  const event = compactEvent(buildSession({ count: 5, tokensEach: 1024 }));
+  const controller = new AbortController();
+  controller.abort();
+  event.signal = controller.signal;
+  const out = await h.emit(event);
+
+  check("no compaction is supplied for an aborted run", out.every((r) => r === undefined));
+  clearSummarizer();
+}
+
+section("10f. the verbatim tail is never cut into (all mechanisms)");
+{
+  // Pi's firstKeptEntryId is the boundary of the last keepRecentTokens: from
+  // there on, messages are kept verbatim. No mechanism may cut past it — a
+  // partial compaction keeps MORE than the standard compactor, never less.
+  const entries = buildSession({ count: 8, tokensEach: 2048, tail: 3 });
+  const event = compactEvent(entries);
+  const hostCutIndex = entries.findIndex((entry) => entry.id === event.preparation.firstKeptEntryId);
+  const tailTexts = new Set(
+    entries
+      .slice(hostCutIndex)
+      .flatMap((entry) => sessionEntryToContextMessages(entry))
+      .map((message) => message.content?.[0]?.text),
+  );
+  const summarizedTexts = (calls) =>
+    new Set(calls.flatMap((call) => call.messages.map((message) => message.content[0].text)));
+
+  // Mechanism A — the host's cut point is kept.
+  {
+    const h = await load({ compactionFallbackChunkTokens: 16384, maxCompactionFallbackChunks: 6 });
+    const calls = installSummarizer();
+    await failCompaction(h, 2);
+    const compaction = compactionOf(await h.emit(event));
+    check(
+      "A: the host's cut point is kept",
+      compaction?.firstKeptEntryId === event.preparation.firstKeptEntryId,
+    );
+    check(
+      "A: no tail message is ever summarized",
+      [...tailTexts].every((text) => !summarizedTexts(calls).has(text)),
+    );
+    clearSummarizer();
+  }
+
+  // Mechanism B — the cut moves earlier, never past the tail boundary. A
+  // small context window forces the prefix cut (the capacity binds, so the
+  // span needs more slices than the budget allows).
+  {
+    const h = await load({ compactionFallbackChunkTokens: 1024, maxCompactionFallbackChunks: 4 });
+    const calls = installSummarizer();
+    await failCompaction(h, 2);
+    const compaction = compactionOf(
+      await h.emit(event, { model: { id: "small", provider: "test", contextWindow: 4096, maxTokens: 32000 } }),
+    );
+    const cutIndex = entries.findIndex((entry) => entry.id === compaction?.firstKeptEntryId);
+    check(
+      "B: the mechanism is a prefix cut",
+      compaction?.details?.mechanism === "prefix-cut",
+      String(compaction?.details?.mechanism),
+    );
+    check(
+      "B: the cut stays before the host's tail boundary",
+      cutIndex >= 0 && cutIndex < hostCutIndex,
+      `cut=${cutIndex} host=${hostCutIndex}`,
+    );
+    check(
+      "B: no tail message is ever summarized",
+      [...tailTexts].every((text) => !summarizedTexts(calls).has(text)),
+    );
+    clearSummarizer();
+  }
+
+  // Mechanism C — drop-only keeps everything from the cut on.
+  {
+    const h = await load({ compactionFallbackChunkTokens: 1024 });
+    installSummarizer(() => {
+      throw new Error("provider exploded");
+    });
+    await failCompaction(h, 2);
+    const compaction = compactionOf(await h.emit(event));
+    const cutIndex = entries.findIndex((entry) => entry.id === compaction?.firstKeptEntryId);
+    check(
+      "C: the cut stays before the host's tail boundary",
+      cutIndex >= 0 && cutIndex < hostCutIndex,
+      `cut=${cutIndex} host=${hostCutIndex}`,
+    );
+    check(
+      "C: the kept tail is intact in the branch after the cut",
+      entries.slice(hostCutIndex).length === 3 &&
+        entries.slice(cutIndex).length > entries.slice(hostCutIndex).length,
+    );
+    clearSummarizer();
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -575,6 +847,45 @@ section("13. split turn — the turn prefix is folded and merged");
     (compaction?.summary ?? "").includes("**Turn Context (split turn):**"),
   );
   check("the merged summary keeps both halves", (compaction?.summary ?? "").startsWith("summary-2"));
+  clearSummarizer();
+}
+
+section("13b. a partial compaction never cuts into a split-turn prefix");
+{
+  const h = await load({ compactionFallbackChunkTokens: 1024, maxCompactionFallbackChunks: 2 });
+  installSummarizer();
+  await failCompaction(h, 2);
+
+  // history (4 x 1024) + a turn prefix (1 x 1024) + the kept tail. The host
+  // summarizes the history, keeps the tail, and folds the prefix separately —
+  // the fold under test only ever saw the history.
+  const history = [];
+  for (let i = 0; i < 4; i++) {
+    history.push(messageEntry(`m${i}`, i % 2 === 0 ? "user" : "assistant", 1024));
+  }
+  const prefixEntry = messageEntry("p0", "user", 1024);
+  const tail = messageEntry("k0", "assistant", 128);
+  const entries = [...history, prefixEntry, tail];
+  const event = compactEvent(entries, {
+    isSplitTurn: true,
+    messagesToSummarize: history.map((entry) => entry.message),
+    turnPrefixMessages: [prefixEntry.message],
+  });
+  const compaction = compactionOf(await h.emit(event));
+
+  check("a partial compaction is still produced", Boolean(compaction));
+  check(
+    "the mechanism is a prefix cut",
+    compaction?.details?.mechanism === "prefix-cut",
+    String(compaction?.details?.mechanism),
+  );
+  const cutIndex = entries.findIndex((entry) => entry.id === compaction?.firstKeptEntryId);
+  const prefixIndex = entries.findIndex((entry) => entry.id === "p0");
+  check(
+    "the cut stays inside the summarized history, never the turn prefix",
+    cutIndex >= 0 && cutIndex < prefixIndex,
+    `cut=${cutIndex} prefix=${prefixIndex}`,
+  );
   clearSummarizer();
 }
 

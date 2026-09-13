@@ -259,3 +259,64 @@ Live E2E (required — the mock cannot prove the host honours our compaction):
    bounded request" acceptable, or do you want a fallback that also survives a
    total provider outage (which would mean a non-LLM summary, e.g. extracting
    file paths and tool results deterministically)?
+
+---
+
+## 9. v2 — the always-works ladder
+
+The v1 guarantee was "succeeds while the provider answers a bounded request"
+(§8 Q4). The operator hit the hole in it: the host's whole-span summary failed
+with a 400 (`156997 input + 11004 output > 168000`), the fallback engaged — and
+its *first* slice came back length-capped, so the attempt threw before a single
+slice was covered and the session dead-ended on "could not summarize the
+context … run /compact manually". Answer to §8 Q4: **yes** — the guarantee is
+now "the session can always continue", provider outage included.
+
+Three additions, in order of use:
+
+1. **Output-aware slice sizing** (`planChunkTokens`). The even share could grow
+   a slice to `span / maxChunks` (25k tokens in the reported case); a summary of
+   that slice does not fit the host's output budget (`min(0.8 * reserveTokens,
+   model.maxTokens)` = 11004 here), so the request is capped and the summary is
+   incomplete. The slice size is now clamped by that budget as well, so the
+   first request normally fits.
+2. **Split-and-retry** (`summarizeSliceBounded`). A slice that still fails with
+   a *size* error — output cap, or an input-too-long 400 — is halved at a
+   message boundary and the halves are folded forward, recursively down to
+   `MIN_COMPACTION_FALLBACK_CHUNK_TOKENS` and `MAX_FALLBACK_SLICE_SPLIT_DEPTH`.
+   Non-size errors (provider down, network) are not retried: a smaller slice
+   cannot fix them.
+3. **Drop-only (mechanism C)**. When no slice could be summarized at all, the
+   oldest ~half of the span is dropped *without* a summary and the cut moves to
+   `findPrefixCut(span, spanTokens / 2)`. No model call is involved, so this is
+   the one rung that works while every provider request is rejected. The
+   placeholder summary states that earlier context was dropped; the operator
+   gets a warning. `compactionFallbackDropOnly: false` restores the v1
+   behaviour (report once, leave the host path alone). A user abort
+   (`event.signal.aborted`) never drops content.
+
+### 9.1 Invariants
+
+- **The recent tail is never touched.** Pi's `firstKeptEntryId` is the boundary
+  of the last `keepRecentTokens` — everything from there on is kept verbatim.
+  Every cut the fallback makes lies inside the span that ends at that boundary,
+  so a partial compaction only ever moves the cut *earlier* and keeps strictly
+  more than the standard compactor. The cut is additionally rejected when it
+  equals the host's own cut.
+- **The split-turn prefix is never cut into** (`cuttableSpan`): the fold does
+  not summarize it in mechanism B, so dropping it would discard content no
+  summary ever saw. If the history region is empty the full span is used —
+  readability beats a dead end.
+- **A partial compaction is always possible once any slice succeeded** (v1
+  §4.3, unchanged): a failure after the first slice yields a prefix cut, never
+  a throw.
+
+### 9.2 Tests added
+
+`test/test-compaction-fallback.mjs` — 6b (a slice never exceeds the summary
+output budget), 10 (provider failure → drop-only, warning, no retry), 10a
+(drop-only disabled → report once), 10c (a capped slice is halved and folded),
+10d (every slice size capped → drop-only, bounded attempts, no dead-end), 10e
+(aborted compaction never drops), 10f (the verbatim tail is never cut into —
+mechanisms A, B and C), 13b (a partial compaction never cuts into a split-turn
+prefix). Suite: 103/103; full repo suite 303/303.

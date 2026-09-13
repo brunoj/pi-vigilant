@@ -153,6 +153,12 @@ interface ExtensionConfig {
   /** Optional `provider/modelId` (or bare model id) to summarize with. */
   compactionFallbackModel?: string;
   /**
+   * Last resort when no slice can be summarized at all: drop the oldest part of
+   * the span without a summary so the session can still continue. This is the
+   * only recovery path that needs no model call.
+   */
+  compactionFallbackDropOnly: boolean;
+  /**
    * Loop Guardian: detect an agent stuck in an endless loop (identical repeated
    * tool calls, cyclic tool-call sequences, or an analysis stall) and steer it
    * out with a user-role message — the same mechanism as the user typing
@@ -242,6 +248,7 @@ function loadConfig(): ExtensionConfig {
           DEFAULT_MAX_COMPACTION_FALLBACK_CHUNKS,
         ),
         compactionFallbackModel: normalizeModelRef(parsed.compactionFallbackModel),
+        compactionFallbackDropOnly: parsed.compactionFallbackDropOnly !== false,
         loopGuardian: parsed.loopGuardian !== false,
         loopRepeatThreshold: normalizeCount(
           parsed.loopRepeatThreshold,
@@ -304,6 +311,7 @@ function loadConfig(): ExtensionConfig {
     compactionFallbackChunkTokens: DEFAULT_COMPACTION_FALLBACK_CHUNK_TOKENS,
     maxCompactionFallbackChunks: DEFAULT_MAX_COMPACTION_FALLBACK_CHUNKS,
     compactionFallbackModel: undefined,
+    compactionFallbackDropOnly: true,
     loopGuardian: true,
     loopRepeatThreshold: DEFAULT_LOOP_REPEAT_THRESHOLD,
     loopCycleRepeats: DEFAULT_LOOP_CYCLE_REPEATS,
@@ -380,6 +388,12 @@ const MIN_COMPACTION_FALLBACK_CHUNK_TOKENS = 1024;
 const COMPACTION_FALLBACK_PROMPT_SLACK_TOKENS = 2048;
 /** Assumed reserve when the host did not report compaction settings. */
 const FALLBACK_ASSUMED_RESERVE_TOKENS = 16_384;
+/**
+ * How often a slice may be halved when the provider rejects it as too large
+ * (output token cap, or input-too-long). Depth 3 turns one slice into at most
+ * 15 bounded requests in the worst case; the floor is the minimum chunk size.
+ */
+const MAX_FALLBACK_SLICE_SPLIT_DEPTH = 3;
 /** Separator Pi uses to join a history summary with a split-turn prefix summary. */
 const TURN_PREFIX_MERGE_SEPARATOR = "\n\n---\n\n**Turn Context (split turn):**\n\n";
 /** Extra instruction for the split-turn prefix — mirrors Pi's own framing. */
@@ -2193,18 +2207,31 @@ export default function (pi: ExtensionAPI): void {
    * scaffolding and up to `0.8 × reserveTokens` of output — all inside the same
    * window. Subtracting those leaves the room the slice may occupy.
    */
+  /**
+   * The output budget the host asks the provider for when it summarizes:
+   * min(80% of the reserve, the model's own cap). It bounds the request on the
+   * input side (capacity) and on the output side (how large a slice may be
+   * before its summary no longer fits).
+   */
+  function summarizationMaxOutputTokens(
+    model: { maxTokens?: number } | undefined,
+    reserveTokens: number,
+  ): number {
+    return Math.min(
+      Math.floor(0.8 * reserveTokens),
+      typeof model?.maxTokens === "number" && model.maxTokens > 0
+        ? model.maxTokens
+        : Number.POSITIVE_INFINITY,
+    );
+  }
+
   function summarizationCapacityTokens(
     model: { contextWindow?: number; maxTokens?: number } | undefined,
     reserveTokens: number,
     previousSummaryTokens: number,
   ): number {
     const window = typeof model?.contextWindow === "number" ? model.contextWindow : 0;
-    const maxOutput = Math.min(
-      Math.floor(0.8 * reserveTokens),
-      typeof model?.maxTokens === "number" && model.maxTokens > 0
-        ? model.maxTokens
-        : Number.POSITIVE_INFINITY,
-    );
+    const maxOutput = summarizationMaxOutputTokens(model, reserveTokens);
     if (window <= 0) {
       return Math.max(MIN_COMPACTION_FALLBACK_CHUNK_TOKENS, config.compactionFallbackChunkTokens);
     }
@@ -2220,15 +2247,31 @@ export default function (pi: ExtensionAPI): void {
    *
    * The even share matters — with a fixed chunk size a large span would need
    * more slices than the budget allows and could never be covered at all.
+   *
+   * The output share matters just as much: the summary a slice produces has to
+   * fit in `maxOutputTokens`, or the request comes back with stopReason
+   * "length" and the summary is incomplete. Without that ceiling the even share
+   * grows a slice to tens of thousands of tokens (a large span divided by the
+   * chunk budget), which is exactly the request that hits the cap — the failure
+   * this fallback exists to survive.
    */
-  function planChunkTokens(spanTokens: number, capacityTokens: number): number {
+  function planChunkTokens(
+    spanTokens: number,
+    capacityTokens: number,
+    maxOutputTokens: number,
+  ): number {
     const evenShare = Math.ceil(
       spanTokens / Math.max(1, config.maxCompactionFallbackChunks),
     );
+    const outputShare =
+      maxOutputTokens > 0
+        ? Math.max(MIN_COMPACTION_FALLBACK_CHUNK_TOKENS, maxOutputTokens)
+        : Number.POSITIVE_INFINITY;
     return Math.max(
       MIN_COMPACTION_FALLBACK_CHUNK_TOKENS,
       Math.min(
         capacityTokens,
+        outputShare,
         Math.max(config.compactionFallbackChunkTokens, evenShare),
       ),
     );
@@ -2254,6 +2297,50 @@ export default function (pi: ExtensionAPI): void {
     }
     if (current.length > 0) slices.push({ messages: current, tokens });
     return slices;
+  }
+
+  /** Estimated size of a message list, in tokens. */
+  function estimateMessagesTokens(messages: AgentMessage[]): number {
+    return messages.reduce(
+      (sum, message) => sum + Math.max(1, estimateTokens(message)),
+      0,
+    );
+  }
+
+  /**
+   * Whether a summarization failure is a size problem a smaller slice can fix:
+   * the output token cap ("generation hit the token cap"), or a provider
+   * rejection for an over-long input. Provider/network errors are not size
+   * problems — a smaller slice cannot fix them, so they must not be retried.
+   */
+  function isSliceTooLargeError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /token cap|maximum context length|prompt is too long|context window|too many tokens|exceeds the maximum|reduce the length of the input|input_tokens/i.test(
+      message,
+    );
+  }
+
+  /**
+   * Split a slice in half at a message boundary, by estimated size. Returns
+   * undefined when there is nothing to split (a single message).
+   */
+  function splitMessagesInHalf(
+    messages: AgentMessage[],
+  ): [AgentMessage[], AgentMessage[]] | undefined {
+    if (messages.length < 2) return undefined;
+    const sizes = messages.map((message) => Math.max(1, estimateTokens(message)));
+    const total = sizes.reduce((sum, size) => sum + size, 0);
+    let accumulated = 0;
+    let index = 0;
+    for (let i = 0; i < sizes.length - 1; i++) {
+      accumulated += sizes[i];
+      if (accumulated >= total / 2) {
+        index = i + 1;
+        break;
+      }
+    }
+    if (index <= 0 || index >= messages.length) return undefined;
+    return [messages.slice(0, index), messages.slice(index)];
   }
 
   /**
@@ -2319,6 +2406,33 @@ export default function (pi: ExtensionAPI): void {
       });
     }
     return span;
+  }
+
+  /**
+   * The entries a partial compaction may cut into.
+   *
+   * The cut may only ever move *earlier* than Pi's own cut, never past it:
+   * everything from `firstKeptEntryId` on is the recent tail Pi keeps verbatim
+   * (the last `keepRecentTokens`), and no fallback mechanism may shrink it. The
+   * span itself already ends there, so this is structural — the guard makes it
+   * explicit.
+   *
+   * A split-turn prefix is excluded as well: it belongs to the turn whose
+   * suffix is kept, and the fold never summarized it (a partial fold stops
+   * before it), so cutting into it would discard content no summary ever saw.
+   * When there is no cuttable history at all the full span is returned —
+   * keeping the turn readable beats dead-ending the session.
+   */
+  function cuttableSpan(
+    branchEntries: SessionBeforeCompactEvent["branchEntries"],
+    preparation: SessionBeforeCompactEvent["preparation"],
+  ): Array<{ entryId: string; message?: AgentMessage; tokens: number }> {
+    const span = spanEntries(branchEntries, preparation);
+    if (!preparation.isSplitTurn) return span;
+    const prefixCount = preparation.turnPrefixMessages?.length ?? 0;
+    if (prefixCount <= 0) return span;
+    const cuttable = span.slice(0, Math.max(0, span.length - prefixCount));
+    return cuttable.length > 0 ? cuttable : span;
   }
 
   /**
@@ -2425,6 +2539,7 @@ export default function (pi: ExtensionAPI): void {
     const previousSummaryTokens = preparation.previousSummary
       ? Math.ceil(preparation.previousSummary.length / 4)
       : 0;
+    const maxOutputTokens = summarizationMaxOutputTokens(model, reserveTokens);
     const capacityTokens = summarizationCapacityTokens(
       model,
       reserveTokens,
@@ -2432,7 +2547,7 @@ export default function (pi: ExtensionAPI): void {
     );
     const slices = chunkSpan(
       history,
-      planChunkTokens(historyTokens, capacityTokens),
+      planChunkTokens(historyTokens, capacityTokens, maxOutputTokens),
     );
 
     // Mechanism A — fold every slice forward, each request bounded, so the whole
@@ -2452,42 +2567,157 @@ export default function (pi: ExtensionAPI): void {
       if (!complete && foldedTokens >= targetTokens) break;
     }
 
-    let summary = preparation.previousSummary;
-    let usage: SummarizationUsage | undefined;
-    let chunks = 0;
-    let coveredTokens = 0;
-    let foldComplete = complete;
-    try {
-      for (const slice of used) {
+    /**
+     * Summarize one slice, splitting it in half and retrying when the request
+     * is too large for the provider — the output token cap ("generation hit the
+     * token cap"), or an input-too-long rejection. A slice that cannot be
+     * summarized in one request is summarized in parts and folded forward, so a
+     * size limit never fails the whole compaction. Non-size errors (provider
+     * down, network) propagate immediately: a smaller slice cannot fix them.
+     */
+    const summarizeSliceBounded = async (
+      messages: AgentMessage[],
+      tokens: number,
+      depth: number,
+      previous: string | undefined,
+    ): Promise<{ text: string; usage: SummarizationUsage; requests: number }> => {
+      try {
         const result = await generateSummaryWithUsage(
-          slice.messages,
+          messages,
           model,
           reserveTokens,
           auth.apiKey,
           auth.headers,
           signal,
           customInstructions,
-          summary,
+          previous,
           ctx.thinkingLevel,
           undefined,
           auth.env,
         );
+        return { text: result.text, usage: result.usage, requests: 1 };
+      } catch (error) {
+        const halves =
+          depth < MAX_FALLBACK_SLICE_SPLIT_DEPTH &&
+          tokens > MIN_COMPACTION_FALLBACK_CHUNK_TOKENS &&
+          !signal.aborted &&
+          isSliceTooLargeError(error)
+            ? splitMessagesInHalf(messages)
+            : undefined;
+        if (!halves) throw error;
+        const first = await summarizeSliceBounded(
+          halves[0],
+          estimateMessagesTokens(halves[0]),
+          depth + 1,
+          previous,
+        );
+        const second = await summarizeSliceBounded(
+          halves[1],
+          estimateMessagesTokens(halves[1]),
+          depth + 1,
+          first.text,
+        );
+        return {
+          text: second.text,
+          usage: combineUsage(first.usage, second.usage),
+          requests: first.requests + second.requests + 1,
+        };
+      }
+    };
+
+    /**
+     * Mechanism C — the last resort. When no slice could be summarized at all,
+     * drop the oldest part of the span without a summary so the context shrinks
+     * and the session can continue. No model call is involved, so this works
+     * even while every provider request is being rejected. The placeholder
+     * summary tells the model (and the operator) that earlier context is gone.
+     */
+    const buildDropOnly = (error: unknown): FallbackCompaction | undefined => {
+      const span = cuttableSpan(event.branchEntries, preparation);
+      const cut = findPrefixCut(span, targetTokens);
+      if (!cut || cut.entryId === preparation.firstKeptEntryId) return undefined;
+      let droppedTokens = 0;
+      for (const item of span) {
+        if (item.entryId === cut.entryId) break;
+        droppedTokens += item.tokens;
+      }
+      const reason = (error instanceof Error ? error.message : String(error))
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 240);
+      const summary = [
+        "## Goal",
+        "(The earlier conversation could not be summarized — it was dropped so the session could continue.)",
+        "",
+        "## Progress",
+        `- pi-vigilant's compaction fallback could not summarize the older messages (${reason}).`,
+        `- The oldest part of the conversation (about ${droppedTokens} tokens) was dropped without a summary. The messages that follow are the most recent part and are intact.`,
+        "",
+        "## Critical Context",
+        "- Earlier details are gone. Ask the user to restate anything that is missing instead of assuming it.",
+      ].join("\n");
+      return {
+        summary,
+        firstKeptEntryId: cut.entryId,
+        tokensBefore: preparation.tokensBefore,
+        usage: undefined,
+        details: {
+          source: "pi-vigilant-compaction-fallback",
+          mechanism: "drop-only",
+          chunks: 0,
+          coveredTokens: 0,
+          partial: true,
+          cutMoved: true,
+          droppedTokens,
+        },
+        partial: true,
+        chunks: 0,
+      };
+    };
+
+    let summary = preparation.previousSummary;
+    let usage: SummarizationUsage | undefined;
+    let chunks = 0;
+    let coveredTokens = 0;
+    let requests = 0;
+    let foldComplete = complete;
+    try {
+      for (const slice of used) {
+        const result = await summarizeSliceBounded(
+          slice.messages,
+          slice.tokens,
+          0,
+          summary,
+        );
         summary = result.text;
         usage = combineUsage(usage, result.usage);
+        requests += result.requests;
         chunks++;
         coveredTokens += slice.tokens;
       }
     } catch (error) {
       // A slice failed — provider error, or the summary generation hit the
       // output token cap (stopReason "length": the summary is incomplete).
-      // Fail fast: do not iterate the remaining slices. But when at least one
-      // slice was already summarized, fall back to Mechanism B (prefix cut)
-      // instead of failing the whole compaction — the summary covers the
-      // successfully summarized prefix and the cut moves to the end of it, so
-      // nothing is discarded that the summary never saw. This is the "fails
-      // partway" branch of the Mechanism B spec: a partial compaction must
-      // always be possible once any slice succeeded.
-      if (chunks === 0) throw error;
+      // Fail fast: do not iterate the remaining slices. A user abort is not a
+      // failure at all — let the host cancel the compaction.
+      if (signal.aborted) throw error;
+      // When at least one slice was already summarized, fall back to Mechanism
+      // B (prefix cut) instead of failing the whole compaction — the summary
+      // covers the successfully summarized prefix and the cut moves to the end
+      // of it, so nothing is discarded that the summary never saw. This is the
+      // "fails partway" branch of the Mechanism B spec: a partial compaction
+      // must always be possible once any slice succeeded.
+      if (chunks === 0) {
+        // Not even the first slice could be summarized. The session must still
+        // be able to continue, so the last resort drops the oldest part of the
+        // span without a summary (Mechanism C). This is the only recovery path
+        // that works when the provider rejects every summarization request — no
+        // model call is involved. Disable with compactionFallbackDropOnly:false.
+        if (!config.compactionFallbackDropOnly) throw error;
+        const dropped = buildDropOnly(error);
+        if (!dropped) throw error;
+        return dropped;
+      }
       foldComplete = false;
     }
 
@@ -2511,6 +2741,7 @@ export default function (pi: ExtensionAPI): void {
         ? `${summary}${TURN_PREFIX_MERGE_SEPARATOR}${result.text}`
         : result.text;
       usage = combineUsage(usage, result.usage);
+      requests++;
       chunks++;
     }
 
@@ -2527,6 +2758,7 @@ export default function (pi: ExtensionAPI): void {
           mechanism: "chunked-fold",
           chunks,
           coveredTokens,
+          requests,
           partial: false,
           cutMoved: false,
         },
@@ -2542,10 +2774,10 @@ export default function (pi: ExtensionAPI): void {
     // compaction should ever take.
     const summarizedTokens = coveredTokens;
     const cut = findPrefixCut(
-      spanEntries(event.branchEntries, preparation),
+      cuttableSpan(event.branchEntries, preparation),
       Math.min(summarizedTokens, targetTokens),
     );
-    if (!cut) {
+    if (!cut || cut.entryId === preparation.firstKeptEntryId) {
       throw new Error(
         "could not find a legal cut point for a partial compaction",
       );
@@ -2561,6 +2793,7 @@ export default function (pi: ExtensionAPI): void {
         mechanism: "prefix-cut",
         chunks,
         coveredTokens: summarizedTokens,
+        requests,
         partial: true,
         cutMoved: cut.entryId !== preparation.firstKeptEntryId,
       },
@@ -3100,11 +3333,19 @@ export default function (pi: ExtensionAPI): void {
         const outcome = await buildFallbackCompaction(event, ctx);
         if (!outcome) return; // nothing to summarize — Pi's own path continues
 
-        ctx.ui.notify(
-          `pi-vigilant supplied the compaction summary (attempt ${attempt}/${config.maxCompactionFallbackAttempts}, ` +
-            `${outcome.chunks} slice${outcome.chunks === 1 ? "" : "s"}${outcome.partial ? ", prefix only" : ""}).`,
-          "info",
-        );
+        if (outcome.details?.mechanism === "drop-only") {
+          ctx.ui.notify(
+            `pi-vigilant could not summarize the context (attempt ${attempt}/${config.maxCompactionFallbackAttempts}) — ` +
+              `it dropped the oldest part of the conversation so the session can continue. Recent messages are intact.`,
+            "warning",
+          );
+        } else {
+          ctx.ui.notify(
+            `pi-vigilant supplied the compaction summary (attempt ${attempt}/${config.maxCompactionFallbackAttempts}, ` +
+              `${outcome.chunks} slice${outcome.chunks === 1 ? "" : "s"}${outcome.partial ? ", prefix only" : ""}).`,
+            "info",
+          );
+        }
         return {
           compaction: {
             summary: outcome.summary,
