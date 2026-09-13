@@ -320,3 +320,20 @@ output budget), 10 (provider failure → drop-only, warning, no retry), 10a
 (aborted compaction never drops), 10f (the verbatim tail is never cut into —
 mechanisms A, B and C), 13b (a partial compaction never cuts into a split-turn
 prefix). Suite: 103/103; full repo suite 303/303.
+
+### 9.3 Live E2E against the real host
+
+`/tmp/pv-compact-e2e/run.sh` drives real pi against a capturing proxy that
+fails the host's summarization on purpose. Four scenarios, all ending in an
+accepted compaction and a continued session (`E2E_OK`):
+
+| mode | injected failure | observed result |
+| --- | --- | --- |
+| `--mechanism-a` | host summary rejected (400, over the byte limit) | `fromExtension=true mechanism=chunked-fold chunks=5 covered=8008 partial=false` |
+| `--mechanism-b` | same, budget binds | `mechanism=prefix-cut chunks=3 covered=6006 partial=true`, then a later `chunked-fold` |
+| `--split` | every summary capped with `finish_reason "length"`; the fallback's first slice capped too | first slice halved (7542 B → 5522 B + 4011 B, both accepted), then `mechanism=chunked-fold chunks=4 covered=6027 partial=false` |
+| `--drop-only` | every summary capped, including both split halves | `mechanism=drop-only chunks=0 covered=0 partial=true`; the host appended the placeholder summary; `grep -c 'could not summarize the context:' pi.out` → 0 |
+
+The proxy reports realistic usage (`prompt_tokens = body/4`) so the host stops
+compacting once the context has actually shrunk — an inflated constant made the
+host compact after every message and masked the outcome.
