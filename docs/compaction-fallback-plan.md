@@ -297,19 +297,23 @@ Three additions, in order of use:
 
 ### 9.1 Invariants
 
-- **The recent tail is never touched.** Pi's `firstKeptEntryId` is the boundary
+- **The recent tail is protected.** Pi's `firstKeptEntryId` is the boundary
   of the last `keepRecentTokens` — everything from there on is kept verbatim.
-  Every cut the fallback makes lies inside the span that ends at that boundary,
-  so a partial compaction only ever moves the cut *earlier* and keeps strictly
-  more than the standard compactor. The cut is additionally rejected when it
-  equals the host's own cut.
+  Every cut the fold makes lies inside the span that ends at that boundary, so a
+  partial compaction keeps strictly more than the standard compactor. Only the
+  v3 fit guarantee (§10.2) may move the cut past it, and then only because the
+  tail alone cannot fit the prompt — with the region it moves past summarized by
+  one more request first.
 - **The split-turn prefix is never cut into** (`cuttableSpan`): the fold does
   not summarize it in mechanism B, so dropping it would discard content no
   summary ever saw. If the history region is empty the full span is used —
-  readability beats a dead end.
+  readability beats a dead end. If the prefix summary itself fails, the fold is
+  marked incomplete and the cut stays before the prefix (v3 §10.2).
 - **A partial compaction is always possible once any slice succeeded** (v1
   §4.3, unchanged): a failure after the first slice yields a prefix cut, never
   a throw.
+- **The new summary replaces the previous one — it never stacks** (v3 §10.1).
+- **The post-compaction context fits the real prompt limit** (v3 §10.1).
 
 ### 9.2 Tests added
 
@@ -317,9 +321,10 @@ Three additions, in order of use:
 output budget), 10 (provider failure → drop-only, warning, no retry), 10a
 (drop-only disabled → report once), 10c (a capped slice is halved and folded),
 10d (every slice size capped → drop-only, bounded attempts, no dead-end), 10e
-(aborted compaction never drops), 10f (the verbatim tail is never cut into —
-mechanisms A, B and C), 13b (a partial compaction never cuts into a split-turn
-prefix). Suite: 103/103; full repo suite 303/303.
+(aborted compaction never drops), 10f (the tail is protected — cut into only
+for the fit, and then summarized), 13b (a partial compaction never cuts into a
+split-turn prefix), 13c (a failed prefix summary keeps the prefix verbatim).
+Suite: 116/116; full repo suite 316/316.
 
 ### 9.3 Live E2E against the real host
 
@@ -337,3 +342,95 @@ accepted compaction and a continued session (`E2E_OK`):
 The proxy reports realistic usage (`prompt_tokens = body/4`) so the host stops
 compacting once the context has actually shrunk — an inflated constant made the
 host compact after every message and masked the outcome.
+
+---
+
+## 10. v3 — "compaction is not allowed to break a loop"
+
+The v2 ladder made compaction *succeed*; the Betamaxx session showed that a
+compaction which succeeds and still leaves the context exhausted is a failure
+mode of its own. The session dead-ended with a loop of *successful* compactions
+that never made the prompt fit, and the user's report was exact: the fallback
+"reports it has worked, but instead of REPLACING the old context it APPENDED to
+it, which results in another compaction and so on."
+
+### 10.1 Root cause, measured on the real session
+
+`/tmp/pv-betamaxx-repro/` replays the real session
+(`…/2026-09-12T13-17-34-937Z_01a095c4….jsonl`, 8593 entries, 43 compactions)
+through the real host modules (`dist/core/compaction/index.js`,
+`dist/core/session-manager.js`).
+
+| fact | measurement |
+| --- | --- |
+| the host's `estimateTokens` is `chars / 4` | real prompt counts were **1.55–2.2×** higher (≈1.83 chars/token) |
+| the retry that failed | `136001` input tokens — **one** over the 136000 limit (`168000 − 32000`) |
+| the fallback's summary | 39233 chars ≈ the host's 39394-char summary → net real reduction **2305 tokens** per compaction |
+| the cut | landed **on** the previous compaction entry (`fk=6cff3d95@8400`), so the host's summary stayed in context and the new one was appended beside it |
+
+Three defects, one outcome: the fold stopped at 50 % of the span with slice
+failures, the estimate that sized everything undercounted real tokens by ~2×,
+and the cut could land on the previous compaction entry so summaries stacked.
+
+### 10.2 The fix
+
+1. **Replace, never stack.** The cut is placed strictly *after* the newest
+   compaction entry on the path (`newestCompactionIndex` → `floorIndex`), so the
+   new summary always supersedes the previous one. The span itself starts where
+   the host's boundary starts (the previous compaction's `firstKeptEntryId`),
+   matching the host's own `boundaryStart`.
+2. **The fold uses its whole budget.** The 50 % early break is gone: every
+   slice the budget allows is summarized, so the cut can land as late as the
+   host's own cut point. `details.chunks` now reflects the whole span.
+3. **The post-compaction context must fit the real limit.** `fitBudget()`
+   measures the host's real-anchored usage against the extension's own estimate
+   (`ratio = clamp(preparation.tokensBefore / contextEstimateTokens(...), 1.75, 3)`)
+   and derives `suffixBudget = floor(limitTokens / ratio) − summaryTokens` with
+   `limitTokens = contextWindow − maxOutput − 2048`. `resolveFallbackCut()` then
+   picks the deepest covered cut point that fits, pushing *later* than the
+   host's cut when the fit demands it.
+4. **Whatever the pushed cut drops is summarized too** — one extra bounded fold
+   for the region between the covered span and the cut; if that fold fails, the
+   summary carries an explicit note and `details.uncoveredTokens` records it.
+5. **A failed split-turn prefix summary is no longer fatal** — the fold is
+   marked incomplete and the cut stays before the prefix (test 13c).
+6. **The last-resort retry is never blocked by the context-pressure cap.**
+   `maxContextPressureCompactions` and its cooldown cap pi-vigilant's *own*
+   recovery; they used to set `overflowRetryBlocked`, which also gated the
+   fallback's `agent_settled` retry — so after two overflow turns the fallback
+   could never run at all. The cap now only blocks when the fallback is
+   disabled. The fallback's own `maxCompactionFallbackAttempts` bounds the loop,
+   and that budget resets when a turn actually completes normally (the health
+   signal) — not on a successful compaction, which the host can report even
+   when the real context still overflows.
+
+### 10.3 Verification
+
+**Real-session replay** (`repro-cut.mjs`, the real host's `buildContextEntries`):
+every subsequent fallback cut lands after the newest compaction, exactly one
+summary remains in context, and the post-compaction estimate drops from ~70512
+to ~32982 (then ~9900):
+
+| entry | cut | mechanism | covered | post-context est | summaries |
+| --- | --- | --- | --- | --- | --- |
+| `#8529` | `fk=2ea3c1a7@8511` | prefix-cut | 59582 | 32982 | 1 |
+| `#8533` | `fk=b88ae5d6@8530` | prefix-cut | 44713 | 9911 | 1 |
+| `#8537` | `fk=942404ac@8534` | prefix-cut | — | 9930 | 1 |
+| `#8541` | `fk=0d720994@8538` | prefix-cut | — | 9929 | 1 |
+| `#8543` | `fk=ec626414@8542` | prefix-cut | 54775 | 9844 | 1 |
+| `#8547` | `fk=c1a1d29c@8544` | prefix-cut | 43580 | 9882 | 1 |
+
+**Live E2E** (`/tmp/pv-compact-e2e/run.sh --fit`, the Betamaxx pattern: real
+tokens ≈ 1.83 × chars/4, the proxy rejects any non-summary request over 136000
+real tokens with the provider's exact overflow message): the host's own
+compaction succeeds and does *not* fix the overflow, the fallback then engages
+(`fromExtension=true mechanism=prefix-cut chunks=3 covered=65091`), and the
+retry is accepted — `turn requests after the last accepted summary: 1
+rejected=0`, `pi exit: 0`, `E2E_OK`. The pre-fix code run against the same
+fixture ends with 5 rejected turn requests and `pi exit: 1`: the fixture
+discriminates, and it reproduces the user's report.
+
+**Unit suite**: 316/316 across seven files, including new section 19 (the new
+summary replaces the previous one — exactly one compaction summary in
+`buildContextEntries`, context shrank) and section 20 (the post-compaction
+context fits the real prompt limit, nothing dropped unsummarized).

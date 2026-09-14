@@ -44,6 +44,7 @@ import type {
   SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
+  buildContextEntries,
   estimateTokens,
   generateSummaryWithUsage,
   getAgentDir,
@@ -386,6 +387,23 @@ const DEFAULT_MAX_COMPACTION_FALLBACK_CHUNKS = 6;
 const MIN_COMPACTION_FALLBACK_CHUNK_TOKENS = 1024;
 /** Room kept in a summarization request for the prompt scaffolding around the slice. */
 const COMPACTION_FALLBACK_PROMPT_SLACK_TOKENS = 2048;
+
+/**
+ * Headroom kept between the post-compaction context and the model's prompt
+ * limit, so the next turn's messages do not immediately overflow again.
+ */
+const COMPACTION_FALLBACK_FIT_SAFETY_TOKENS = 2048;
+
+/**
+ * Pi estimates tokens as chars/4. For code/JSON-heavy sessions the provider's
+ * real count is 1.5-2.2× that estimate, so every fit decision that trusts the
+ * estimate alone is wrong in the dangerous direction: the fallback thinks the
+ * context fits, the retry is rejected again, and the session dead-ends. The
+ * measured ratio is clamped to this range; the floor guarantees the check stays
+ * conservative even when the session's own anchor undercounts.
+ */
+const COMPACTION_FALLBACK_FIT_RATIO_FLOOR = 1.75;
+const COMPACTION_FALLBACK_FIT_RATIO_CEILING = 3;
 /** Assumed reserve when the host did not report compaction settings. */
 const FALLBACK_ASSUMED_RESERVE_TOKENS = 16_384;
 /**
@@ -2364,6 +2382,58 @@ export default function (pi: ExtensionAPI): void {
     }
   }
 
+  /** One entry of the span a fallback compaction may summarize. */
+  interface SpanItem {
+    /** Index of the entry in `branchEntries`. */
+    index: number;
+    entryId: string;
+    message?: AgentMessage;
+    tokens: number;
+  }
+
+  /**
+   * The newest compaction entry on the path, or -1 when there is none.
+   *
+   * Pi renders every compaction entry at or after `firstKeptEntryId` as a
+   * summary message in the context, so a cut placed at or before this entry
+   * keeps the previous summary AND appends the new one: the context grows by a
+   * whole summary, the compaction barely shrinks it, the next turn overflows
+   * again, and the session compacts forever without progress. The fallback's
+   * cut must therefore land *after* this entry, so the new summary replaces the
+   * old one instead of stacking next to it.
+   */
+  function newestCompactionIndex(
+    branchEntries: SessionBeforeCompactEvent["branchEntries"],
+  ): number {
+    for (let i = branchEntries.length - 1; i >= 0; i--) {
+      if (branchEntries[i].type === "compaction") return i;
+    }
+    return -1;
+  }
+
+  /**
+   * Where the newest compaction on the path stopped keeping entries — the
+   * boundary Pi itself summarizes from.
+   *
+   * Deliberately *not* "the newest compaction before the cut": a compaction
+   * entry can sit after Pi's cut point (an earlier fallback cut early), and
+   * using that one as the boundary keeps the span aligned with
+   * `preparation.messagesToSummarize`, so a slice index maps back to exactly
+   * one entry and the coverage accounting stays honest.
+   */
+  function spanStartIndex(
+    branchEntries: SessionBeforeCompactEvent["branchEntries"],
+  ): number {
+    const last = newestCompactionIndex(branchEntries);
+    if (last < 0) return 0;
+    const kept = (branchEntries[last] as { firstKeptEntryId?: string })
+      .firstKeptEntryId;
+    const keptIndex = kept
+      ? branchEntries.findIndex((entry) => entry.id === kept)
+      : -1;
+    return keptIndex >= 0 ? keptIndex : last + 1;
+  }
+
   /**
    * The branch entries that make up the span being replaced.
    *
@@ -2374,31 +2444,20 @@ export default function (pi: ExtensionAPI): void {
   function spanEntries(
     branchEntries: SessionBeforeCompactEvent["branchEntries"],
     preparation: SessionBeforeCompactEvent["preparation"],
-  ): Array<{ entryId: string; message?: AgentMessage; tokens: number }> {
+  ): SpanItem[] {
     const hostCutIndex = branchEntries.findIndex(
       (entry) => entry.id === preparation.firstKeptEntryId,
     );
     const end = hostCutIndex >= 0 ? hostCutIndex : branchEntries.length;
+    const start = spanStartIndex(branchEntries);
 
-    // The span starts where the previous compaction stopped keeping entries.
-    let start = 0;
-    for (let i = end - 1; i >= 0; i--) {
-      const entry = branchEntries[i];
-      if (entry.type === "compaction") {
-        const keptIndex = branchEntries.findIndex(
-          (candidate) => candidate.id === entry.firstKeptEntryId,
-        );
-        start = keptIndex >= 0 ? keptIndex : i + 1;
-        break;
-      }
-    }
-
-    const span: Array<{ entryId: string; message?: AgentMessage; tokens: number }> = [];
+    const span: SpanItem[] = [];
     for (let i = start; i < end; i++) {
       const entry = branchEntries[i];
       const messages = sessionEntryToContextMessages(entry);
       if (messages.length === 0) continue;
       span.push({
+        index: i,
         entryId: entry.id,
         // Pi's compaction takes only the first context message of an entry.
         message: messages[0],
@@ -2411,22 +2470,16 @@ export default function (pi: ExtensionAPI): void {
   /**
    * The entries a partial compaction may cut into.
    *
-   * The cut may only ever move *earlier* than Pi's own cut, never past it:
-   * everything from `firstKeptEntryId` on is the recent tail Pi keeps verbatim
-   * (the last `keepRecentTokens`), and no fallback mechanism may shrink it. The
-   * span itself already ends there, so this is structural — the guard makes it
-   * explicit.
-   *
-   * A split-turn prefix is excluded as well: it belongs to the turn whose
-   * suffix is kept, and the fold never summarized it (a partial fold stops
-   * before it), so cutting into it would discard content no summary ever saw.
-   * When there is no cuttable history at all the full span is returned —
-   * keeping the turn readable beats dead-ending the session.
+   * A split-turn prefix is excluded: it belongs to the turn whose suffix is
+   * kept, and the fold never summarized it (a partial fold stops before it), so
+   * cutting into it would discard content no summary ever saw. When there is no
+   * cuttable history at all the full span is returned — keeping the turn
+   * readable beats dead-ending the session.
    */
   function cuttableSpan(
     branchEntries: SessionBeforeCompactEvent["branchEntries"],
     preparation: SessionBeforeCompactEvent["preparation"],
-  ): Array<{ entryId: string; message?: AgentMessage; tokens: number }> {
+  ): SpanItem[] {
     const span = spanEntries(branchEntries, preparation);
     if (!preparation.isSplitTurn) return span;
     const prefixCount = preparation.turnPrefixMessages?.length ?? 0;
@@ -2435,26 +2488,153 @@ export default function (pi: ExtensionAPI): void {
     return cuttable.length > 0 ? cuttable : span;
   }
 
-  /**
-   * The last legal cut point at or before `targetTokens`.
-   *
-   * Cutting at or before the target is what makes a partial compaction safe:
-   * everything the summary does not cover is still in the context.
-   */
-  function findPrefixCut(
-    span: Array<{ entryId: string; message?: AgentMessage; tokens: number }>,
-    targetTokens: number,
-  ): { entryId: string; message?: AgentMessage; tokens: number } | undefined {
-    let accumulated = 0;
-    let best: { entryId: string; message?: AgentMessage; tokens: number } | undefined;
-    for (const item of span) {
-      if (item.message && isCutPointMessage(item.message)) {
-        if (accumulated > targetTokens) break;
-        best = item;
+  /** Estimated size (chars/4) of the context Pi would send for this path. */
+  function contextEstimateTokens(
+    branchEntries: SessionBeforeCompactEvent["branchEntries"],
+  ): number {
+    let tokens = 0;
+    for (const entry of buildContextEntries(branchEntries)) {
+      for (const message of sessionEntryToContextMessages(entry)) {
+        tokens += Math.max(1, estimateTokens(message));
       }
-      accumulated += item.tokens;
     }
-    return best;
+    return tokens;
+  }
+
+  /** Estimated size (chars/4) of the entries kept from `fromIndex` on. */
+  function suffixTokens(
+    branchEntries: SessionBeforeCompactEvent["branchEntries"],
+    fromIndex: number,
+  ): number {
+    let tokens = 0;
+    for (let i = Math.max(0, fromIndex); i < branchEntries.length; i++) {
+      for (const message of sessionEntryToContextMessages(branchEntries[i])) {
+        tokens += Math.max(1, estimateTokens(message));
+      }
+    }
+    return tokens;
+  }
+
+  interface FitBudget {
+    /** How much larger the provider's real count is than the chars/4 estimate. */
+    ratio: number;
+    /** The largest suffix estimate (chars/4 units) that still fits the window. */
+    suffixBudget: number;
+    /** Real prompt limit the post-compaction context has to stay under. */
+    limitTokens: number;
+  }
+
+  /**
+   * What the post-compaction context may still weigh.
+   *
+   * The retry Pi sends after a compaction requests the full output budget, so
+   * the prompt may be at most `window − maxTokens`. Pi's own estimate is
+   * chars/4, which undercounts code/JSON-heavy sessions by up to ~2.2×, so the
+   * check scales the estimate by the ratio measured from the host's own
+   * anchored estimate (`tokensBefore` is real usage plus estimated trailing
+   * messages) and never goes below the conservative floor. An undercounted fit
+   * check is exactly how a compaction leaves the context exhausted and breaks
+   * the turn.
+   */
+  function fitBudget(
+    ctx: ExtensionContext,
+    branchEntries: SessionBeforeCompactEvent["branchEntries"],
+    preparation: SessionBeforeCompactEvent["preparation"],
+    summaryTokens: number,
+  ): FitBudget | undefined {
+    const window =
+      typeof ctx.model?.contextWindow === "number" ? ctx.model.contextWindow : 0;
+    if (window <= 0) return undefined;
+    const maxOutput =
+      typeof ctx.model?.maxTokens === "number" && ctx.model.maxTokens > 0
+        ? ctx.model.maxTokens
+        : 0;
+    const limitTokens = Math.max(
+      0,
+      window - maxOutput - COMPACTION_FALLBACK_FIT_SAFETY_TOKENS,
+    );
+    const estimate = Math.max(1, contextEstimateTokens(branchEntries));
+    const anchored =
+      typeof preparation.tokensBefore === "number" ? preparation.tokensBefore : 0;
+    const measured = anchored > 0 ? anchored / estimate : 1;
+    const ratio = Math.min(
+      COMPACTION_FALLBACK_FIT_RATIO_CEILING,
+      Math.max(COMPACTION_FALLBACK_FIT_RATIO_FLOOR, measured),
+    );
+    // Both the kept suffix and the new summary are estimated in chars/4 units,
+    // so the whole post-compaction context is scaled by the same ratio before
+    // it is compared with the real limit.
+    const suffixBudget = Math.max(
+      0,
+      Math.floor(limitTokens / ratio) - summaryTokens,
+    );
+    return { ratio, suffixBudget, limitTokens };
+  }
+
+  interface FallbackCut {
+    /** Index in `branchEntries` where the kept tail starts. */
+    index: number;
+    entryId: string;
+    /** True when the cut drops entries the fold never summarized. */
+    uncovered: boolean;
+  }
+
+  /**
+   * Choose where the fallback's summary ends.
+   *
+   * Rules, in priority order:
+   *  1. The cut comes after the newest compaction entry, so the new summary
+   *     replaces the previous one instead of being appended next to it.
+   *  2. The cut is the deepest cut point the fold actually covered: everything
+   *     summarized is dropped, so the context shrinks as much as the work done
+   *     allows. Keeping summarized messages verbatim is what leaves the context
+   *     at the limit and causes the next compaction.
+   *  3. The kept suffix has to fit the model's real prompt limit. When the
+   *     deepest covered cut point is still too heavy, the cut moves later until
+   *     the suffix fits — dropping more, but continuing the session.
+   */
+  function resolveFallbackCut(
+    branchEntries: SessionBeforeCompactEvent["branchEntries"],
+    floorIndex: number,
+    coverageLimit: number,
+    suffixBudget: number,
+  ): FallbackCut | undefined {
+    const from = Math.max(0, floorIndex);
+    const candidates: number[] = [];
+    for (let i = from; i < branchEntries.length; i++) {
+      const entry = branchEntries[i];
+      if (!entry) continue;
+      if (sessionEntryToContextMessages(entry).some(isCutPointMessage)) {
+        candidates.push(i);
+      }
+    }
+    if (candidates.length === 0) return undefined;
+
+    // Rule 2: the deepest covered cut point (the list is in path order).
+    let deepestCovered: number | undefined;
+    for (const index of candidates) {
+      if (index <= coverageLimit) deepestCovered = index;
+      else break;
+    }
+    let chosen: number;
+    if (deepestCovered === undefined) {
+      // Nothing was covered up to the limit: start at the earliest legal cut
+      // point (keep as much as possible) and let rule 3 push it later.
+      chosen = candidates[0];
+    } else {
+      chosen = deepestCovered;
+      if (suffixTokens(branchEntries, chosen) > suffixBudget) {
+        // Rule 3: move later until the kept suffix fits.
+        const fitting = candidates.find(
+          (index) =>
+            index >= chosen && suffixTokens(branchEntries, index) <= suffixBudget,
+        );
+        chosen = fitting ?? candidates[candidates.length - 1];
+      }
+    }
+    const entryId = branchEntries[chosen]?.id;
+    if (!entryId) return undefined;
+    return { index: chosen, entryId, uncovered: chosen > coverageLimit };
   }
 
   /** Sum two provider usage reports, keeping the optional fields of the latest. */
@@ -2554,18 +2734,24 @@ export default function (pi: ExtensionAPI): void {
     // span is covered and the host's own cut point can be kept.
     const complete = slices.length <= historyChunkBudget;
     // Mechanism B — the span needs more slices than the budget allows, so only a
-    // prefix can be summarized and the cut point has to move. Fold just far
-    // enough to cover the prefix we are about to drop (half the span): folding
-    // the whole budget would summarize messages that are kept anyway.
-    const targetTokens = Math.ceil(historyTokens / 2);
-    let foldedTokens = 0;
+    // prefix can be summarized and the cut point has to move. Fold the whole
+    // budget: every covered message is one the cut may drop, and dropping
+    // summarized messages is the only way the context actually shrinks. (Stopping
+    // at half the span left the other half verbatim, the context stayed at the
+    // limit, and the next turn compacted again — the loop this fallback exists
+    // to break.)
     const used: typeof slices = [];
     for (const slice of slices) {
       if (used.length >= historyChunkBudget) break;
       used.push(slice);
-      foldedTokens += slice.tokens;
-      if (!complete && foldedTokens >= targetTokens) break;
     }
+    const usedTokens = used.reduce((sum, slice) => sum + slice.tokens, 0);
+    // How many of the span's messages the fold covers, in order — the cut may
+    // never drop a message no slice ever saw.
+    const usedMessages = used.reduce(
+      (sum, slice) => sum + slice.messages.length,
+      0,
+    );
 
     /**
      * Summarize one slice, splitting it in half and retrying when the request
@@ -2634,11 +2820,36 @@ export default function (pi: ExtensionAPI): void {
      */
     const buildDropOnly = (error: unknown): FallbackCompaction | undefined => {
       const span = cuttableSpan(event.branchEntries, preparation);
-      const cut = findPrefixCut(span, targetTokens);
+      const hostCutIndex = event.branchEntries.findIndex(
+        (entry) => entry.id === preparation.firstKeptEntryId,
+      );
+      const floorIndex = newestCompactionIndex(event.branchEntries) + 1;
+      // Drop about half the span when that is enough to fit, more when it is
+      // not: the placeholder carries no detail, so keep the recent tail intact
+      // unless the window forces more away.
+      const spanTotal = span.reduce((sum, item) => sum + item.tokens, 0);
+      let accumulated = 0;
+      let halfIndex = span.length > 0 ? span[span.length - 1].index : -1;
+      for (const item of span) {
+        accumulated += item.tokens;
+        if (accumulated >= Math.ceil(spanTotal / 2)) {
+          halfIndex = item.index;
+          break;
+        }
+      }
+      const coverageLimit = halfIndex;
+      const fit = fitBudget(ctx, event.branchEntries, preparation, 200);
+      const suffixBudget = fit ? fit.suffixBudget : Number.POSITIVE_INFINITY;
+      const cut = resolveFallbackCut(
+        event.branchEntries,
+        floorIndex,
+        coverageLimit,
+        suffixBudget,
+      );
       if (!cut || cut.entryId === preparation.firstKeptEntryId) return undefined;
       let droppedTokens = 0;
       for (const item of span) {
-        if (item.entryId === cut.entryId) break;
+        if (item.index >= cut.index) break;
         droppedTokens += item.tokens;
       }
       const reason = (error instanceof Error ? error.message : String(error))
@@ -2669,6 +2880,7 @@ export default function (pi: ExtensionAPI): void {
           partial: true,
           cutMoved: true,
           droppedTokens,
+          suffixTokens: suffixTokens(event.branchEntries, cut.index),
         },
         partial: true,
         chunks: 0,
@@ -2695,8 +2907,7 @@ export default function (pi: ExtensionAPI): void {
         chunks++;
         coveredTokens += slice.tokens;
       }
-    } catch (error) {
-      // A slice failed — provider error, or the summary generation hit the
+    } catch (error) {      // A slice failed — provider error, or the summary generation hit the
       // output token cap (stopReason "length": the summary is incomplete).
       // Fail fast: do not iterate the remaining slices. A user abort is not a
       // failure at all — let the host cancel the compaction.
@@ -2722,67 +2933,118 @@ export default function (pi: ExtensionAPI): void {
     }
 
     // The turn prefix is only replaced when the cut point moves past it, i.e.
-    // when the fold covered the whole span.
+    // when the fold covered the whole span. If its summary fails, the fold is
+    // no longer complete: the cut then stays before the prefix (coverageLimit),
+    // so the messages that could not be summarized are kept verbatim instead of
+    // being dropped — a failed prefix summary must never dead-end the session.
     if (foldComplete && hasTurnPrefix) {
-      const result = await generateSummaryWithUsage(
-        turnPrefix,
-        model,
-        reserveTokens,
-        auth.apiKey,
-        auth.headers,
-        signal,
-        TURN_PREFIX_INSTRUCTIONS,
-        undefined,
-        ctx.thinkingLevel,
-        undefined,
-        auth.env,
-      );
-      summary = summary
-        ? `${summary}${TURN_PREFIX_MERGE_SEPARATOR}${result.text}`
-        : result.text;
-      usage = combineUsage(usage, result.usage);
-      requests++;
-      chunks++;
+      try {
+        const result = await generateSummaryWithUsage(
+          turnPrefix,
+          model,
+          reserveTokens,
+          auth.apiKey,
+          auth.headers,
+          signal,
+          TURN_PREFIX_INSTRUCTIONS,
+          undefined,
+          ctx.thinkingLevel,
+          undefined,
+          auth.env,
+        );
+        summary = summary
+          ? `${summary}${TURN_PREFIX_MERGE_SEPARATOR}${result.text}`
+          : result.text;
+        usage = combineUsage(usage, result.usage);
+        requests++;
+        chunks++;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        foldComplete = false;
+      }
     }
 
     if (!summary) return undefined;
 
-    if (foldComplete) {
-      return {
-        summary,
-        firstKeptEntryId: preparation.firstKeptEntryId,
-        tokensBefore: preparation.tokensBefore,
-        usage,
-        details: {
-          source: "pi-vigilant-compaction-fallback",
-          mechanism: "chunked-fold",
-          chunks,
-          coveredTokens,
-          requests,
-          partial: false,
-          cutMoved: false,
-        },
-        partial: false,
-        chunks,
-      };
-    }
-
-    // Mechanism B — the span needs more slices than the budget allows. Keep the
-    // host's cut point only if the whole span was covered; otherwise summarize a
-    // prefix and move the cut to the end of it, so nothing is discarded that the
-    // summary never saw. Aim for half the span, which is the most a partial
-    // compaction should ever take.
-    const summarizedTokens = coveredTokens;
-    const cut = findPrefixCut(
-      cuttableSpan(event.branchEntries, preparation),
-      Math.min(summarizedTokens, targetTokens),
+    // ── Where the kept tail starts ──────────────────────────────────────
+    // The cut has to satisfy three constraints at once:
+    //   1. after the newest compaction entry, so the new summary replaces the
+    //      old one instead of stacking next to it;
+    //   2. no later than what the fold covered, so nothing is dropped that no
+    //      summary ever saw;
+    //   3. small enough that the kept suffix plus the new summary fits the
+    //      model's real prompt limit, so the retry cannot be rejected again.
+    // When (3) forces the cut past (2), the extra messages are folded in below;
+    // if that fails they are reported as dropped in the summary itself.
+    const branchEntries = event.branchEntries;
+    const span = cuttableSpan(branchEntries, preparation);
+    const hostCutIndex = branchEntries.findIndex(
+      (entry) => entry.id === preparation.firstKeptEntryId,
     );
-    if (!cut || cut.entryId === preparation.firstKeptEntryId) {
+    const floorIndex = newestCompactionIndex(branchEntries) + 1;
+    const spanMessageItems = span.filter((item) => item.message);
+    const coveredSpanIndex =
+      usedMessages > 0
+        ? (spanMessageItems[Math.min(usedMessages, spanMessageItems.length) - 1]
+            ?.index ?? -1)
+        : -1;
+    // A complete fold covered everything before Pi's own cut, so that cut stays
+    // legal; a partial fold may only cut where the summary actually covers.
+    const coverageLimit = foldComplete
+      ? hostCutIndex >= 0
+        ? hostCutIndex
+        : branchEntries.length - 1
+      : coveredSpanIndex;
+    const summaryTokens = Math.ceil(summary.length / 4);
+    const fit = fitBudget(ctx, branchEntries, preparation, summaryTokens);
+    const suffixBudget = fit ? fit.suffixBudget : Number.POSITIVE_INFINITY;
+    const cut = resolveFallbackCut(
+      branchEntries,
+      floorIndex,
+      coverageLimit,
+      suffixBudget,
+    );
+    if (!cut) {
       throw new Error(
         "could not find a legal cut point for a partial compaction",
       );
     }
 
+    // The fit moved the cut past what the fold summarized: summarize the extra
+    // messages in one more bounded request so the drop is covered by the
+    // summary. If that fails (provider down), say so in the summary instead of
+    // pretending the region is intact.
+    let uncoveredTokens = 0;
+    if (cut.uncovered && coveredSpanIndex >= 0) {
+      const extra: AgentMessage[] = [];
+      for (let i = coveredSpanIndex + 1; i < cut.index; i++) {
+        const [message] = sessionEntryToContextMessages(branchEntries[i]);
+        if (message) extra.push(message);
+      }
+      if (extra.length > 0) {
+        const extraTokens = estimateMessagesTokens(extra);
+        try {
+          const result = await summarizeSliceBounded(
+            extra,
+            extraTokens,
+            0,
+            summary,
+          );
+          summary = result.text;
+          usage = combineUsage(usage, result.usage);
+          requests += result.requests;
+          chunks++;
+          coveredTokens += extraTokens;
+        } catch (error) {
+          if (signal.aborted) throw error;
+          uncoveredTokens = extraTokens;
+          summary = `${summary}\n\n(Note: ${extra.length} message(s) after the summarized history — about ${uncoveredTokens} tokens — were dropped without being summarized so the context could fit.)`;
+        }
+      }
+    }
+
+    const cutMoved = cut.index !== hostCutIndex;
+    const partial = !foldComplete || cutMoved;
     return {
       summary,
       firstKeptEntryId: cut.entryId,
@@ -2790,14 +3052,22 @@ export default function (pi: ExtensionAPI): void {
       usage,
       details: {
         source: "pi-vigilant-compaction-fallback",
-        mechanism: "prefix-cut",
+        mechanism: partial ? "prefix-cut" : "chunked-fold",
         chunks,
-        coveredTokens: summarizedTokens,
+        coveredTokens,
         requests,
-        partial: true,
-        cutMoved: cut.entryId !== preparation.firstKeptEntryId,
+        partial,
+        cutMoved,
+        ...(fit
+          ? {
+              fitRatio: fit.ratio,
+              suffixTokens: suffixTokens(branchEntries, cut.index),
+              fitLimitTokens: fit.limitTokens,
+            }
+          : {}),
+        ...(uncoveredTokens > 0 ? { uncoveredTokens } : {}),
       },
-      partial: true,
+      partial,
       chunks,
     };
   }
@@ -3050,16 +3320,21 @@ export default function (pi: ExtensionAPI): void {
         (isContextOverflow(assistant, ctx.model?.contextWindow) ||
           contextUsageNearlyFull(ctx))
       ) {
-        // Hard cap: never compact in a loop.
+        // Hard cap: never compact in a loop. The cap only stops pi-vigilant's
+        // own recovery. When the compaction fallback is enabled it is the last
+        // resort and carries its own attempt budget, so blocking it here would
+        // dead-end the session — the one outcome the fallback exists to prevent.
         if (
           state.contextPressureCompactionsQueued >=
           config.maxContextPressureCompactions
         ) {
-          state.overflowRetryBlocked = true;
-          ctx.ui.notify(
-            "Context remains exhausted after automatic compaction. Stopping automatic continuations; start a new session or select a larger-context model.",
-            "warning",
-          );
+          if (!config.compactionFallback) {
+            state.overflowRetryBlocked = true;
+            ctx.ui.notify(
+              "Context remains exhausted after automatic compaction. Stopping automatic continuations; start a new session or select a larger-context model.",
+              "warning",
+            );
+          }
           return;
         }
         const now = Date.now();
@@ -3067,11 +3342,13 @@ export default function (pi: ExtensionAPI): void {
           now - state.lastContextPressureCompactionTime <
           CONTEXT_PRESSURE_COMPACTION_COOLDOWN_MS
         ) {
-          state.overflowRetryBlocked = true;
-          ctx.ui.notify(
-            "Context overflow detected, but a compaction ran moments ago. Waiting for the cooldown before compacting again.",
-            "warning",
-          );
+          if (!config.compactionFallback) {
+            state.overflowRetryBlocked = true;
+            ctx.ui.notify(
+              "Context overflow detected, but a compaction ran moments ago. Waiting for the cooldown before compacting again.",
+              "warning",
+            );
+          }
           return;
         }
         state.lastContextPressureCompactionTime = now;
@@ -3119,6 +3396,12 @@ export default function (pi: ExtensionAPI): void {
 
     // If we get here, the response was conclusive (normal stop with complete text).
     state.lastResponseConclusive = true;
+    // A turn that completes normally proves the provider accepts the context
+    // again, so the compaction fallback gets a fresh attempt budget for the
+    // next episode. This is the health signal — not a successful compaction,
+    // which the host can report even when the real context still overflows.
+    state.compactionFallbackAttempts = 0;
+    state.compactionFallbackExhausted = false;
   });
 
   // ── Stale-continuation filter ─────────────────────────────────────
@@ -3150,13 +3433,15 @@ export default function (pi: ExtensionAPI): void {
       // loop. Placed before the config gate so the reset always happens.
       noteFreshWindow();
 
-      // A successful compaction is the fallback's whole purpose: whatever was
-      // failing is no longer failing, so the failure streak, the arming and the
-      // attempt budget all start over.
+      // A successful compaction means the compaction path works again, so the
+      // failure streak and the arming reset. The attempt budget does NOT: the
+      // host's own compaction can succeed and still leave the real context over
+      // the limit (its whole-span summary barely shrinks a session whose real
+      // token count is ~2× Pi's estimate), and resetting there would let the
+      // recovery loop run forever. The budget resets when a turn actually
+      // completes normally — that is the signal the context fits again.
       state.consecutiveCompactionFailures = 0;
       state.compactionFallbackArmed = false;
-      state.compactionFallbackAttempts = 0;
-      state.compactionFallbackExhausted = false;
 
       if (!config.compactionContinuation) return;
 
@@ -3248,8 +3533,6 @@ export default function (pi: ExtensionAPI): void {
   pi.on(
     "session_compact_failed",
     async (event: SessionCompactFailedEvent, ctx: ExtensionContext) => {
-      let ctxOk = "?";
-      try { ctxOk = String(!!ctx.modelRegistry); } catch (e) { ctxOk = "STALE:" + (e as Error).message.slice(0, 40); }
       if (!config.compactionFallback) return;
       if (event.aborted) return;
 
@@ -3310,10 +3593,6 @@ export default function (pi: ExtensionAPI): void {
   pi.on(
     "session_before_compact",
     async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
-      try {
-      } catch (e) {
-        return;
-      }
       if (!config.compactionFallback) return;
       // Dormant: while compaction is working, Pi's own path stays in charge.
       if (!state.compactionFallbackArmed) return;

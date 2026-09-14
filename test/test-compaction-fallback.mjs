@@ -34,7 +34,7 @@
 import { loadExtension } from "./harness.mjs";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages, buildContextEntries } from "@earendil-works/pi-coding-agent";
 
 const EXT = process.env.PV_EXT || new URL("../index.ts", import.meta.url).pathname;
 const REPO = path.dirname(EXT);
@@ -216,6 +216,43 @@ async function failCompaction(h, n = 2, event = {}) {
 
 function compactionOf(emitResults) {
   return emitResults.find((result) => result && result.compaction)?.compaction;
+}
+
+/**
+ * Messages of `entries` that are neither in a summarizer request nor kept after
+ * the compaction's cut — i.e. content the compaction silently threw away. The
+ * compaction contract is that this set is always empty.
+ */
+function uncoveredOf(entries, compaction, calls) {
+  const summarized = new Set(
+    calls.flatMap((call) =>
+      call.messages.map((message) => message.content?.[0]?.text),
+    ),
+  );
+  const cutIndex = entries.findIndex(
+    (entry) => entry.id === compaction?.firstKeptEntryId,
+  );
+  const kept = new Set(
+    entries
+      .slice(Math.max(0, cutIndex))
+      .flatMap((entry) => sessionEntryToContextMessages(entry))
+      .map((message) => message.content?.[0]?.text),
+  );
+  return entries
+    .flatMap((entry) => sessionEntryToContextMessages(entry))
+    .map((message) => message.content?.[0]?.text)
+    .filter((text) => text && !summarized.has(text) && !kept.has(text));
+}
+
+/** Estimated size (chars/4) of the context Pi would send for these entries. */
+function contextEstimate(entries) {
+  let tokens = 0;
+  for (const entry of buildContextEntries(entries)) {
+    for (const message of sessionEntryToContextMessages(entry)) {
+      tokens += Math.max(1, Math.ceil((message.content?.[0]?.text?.length ?? 0) / 4));
+    }
+  }
+  return tokens;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -400,9 +437,11 @@ section("7-9. mechanism B — prefix cut when the span exceeds the chunk budget"
 
   check("a partial compaction is still returned (progress, not a stuck session)", Boolean(compaction));
   check("the mechanism is recorded as a prefix cut", compaction?.details?.mechanism === "prefix-cut");
-  // The fold stops once the prefix that will be dropped is covered (half of
-  // 10 x 1024), so it never spends the whole budget on messages it keeps.
-  check("the fold stops at the dropped prefix, not at the whole budget", calls.length === 5, `${calls.length} calls`);
+  // The fold spends the whole budget: every covered message is one the cut may
+  // drop, and dropping summarized messages is the only way the context shrinks
+  // enough to continue. (Stopping at half the span left the other half verbatim,
+  // the context stayed at the limit and the next turn compacted again.)
+  check("the fold uses the whole budget", calls.length === 6, `${calls.length} calls`);
   check("the fold never exceeds the chunk budget", calls.length <= 6, `${calls.length} calls`);
   check(
     "the cut point moves forward, away from the host's",
@@ -684,11 +723,14 @@ section("10e. an aborted compaction never drops content");
   clearSummarizer();
 }
 
-section("10f. the verbatim tail is never cut into (all mechanisms)");
+section("10f. the tail is protected — cut into only for the fit, and then summarized");
 {
   // Pi's firstKeptEntryId is the boundary of the last keepRecentTokens: from
-  // there on, messages are kept verbatim. No mechanism may cut past it — a
-  // partial compaction keeps MORE than the standard compactor, never less.
+  // there on, messages are kept verbatim. Mechanisms A and B keep that
+  // boundary; only the fit guarantee may move the cut past it (a context that
+  // still overflows after the compaction is the loop this fallback exists to
+  // break), and whatever it moves past is summarized by one more request —
+  // dropping messages unsummarized is the one thing this fallback must never do.
   const entries = buildSession({ count: 8, tokensEach: 2048, tail: 3 });
   const event = compactEvent(entries);
   const hostCutIndex = entries.findIndex((entry) => entry.id === event.preparation.firstKeptEntryId);
@@ -718,9 +760,13 @@ section("10f. the verbatim tail is never cut into (all mechanisms)");
     clearSummarizer();
   }
 
-  // Mechanism B — the cut moves earlier, never past the tail boundary. A
-  // small context window forces the prefix cut (the capacity binds, so the
-  // span needs more slices than the budget allows).
+  // Mechanism B — the cut moves to the deepest point the fold covered, and the
+  // fit budget can push it further: a small context window forces the prefix cut
+  // (the capacity binds, so the span needs more slices than the budget allows),
+  // and when the covered prefix alone cannot bring the context under the limit
+  // the cut moves past Pi's tail boundary. The messages it then drops are
+  // summarized by one more request — dropping them unsummarized is the one thing
+  // this fallback must never do.
   {
     const h = await load({ compactionFallbackChunkTokens: 1024, maxCompactionFallbackChunks: 4 });
     const calls = installSummarizer();
@@ -735,13 +781,14 @@ section("10f. the verbatim tail is never cut into (all mechanisms)");
       String(compaction?.details?.mechanism),
     );
     check(
-      "B: the cut stays before the host's tail boundary",
-      cutIndex >= 0 && cutIndex < hostCutIndex,
-      `cut=${cutIndex} host=${hostCutIndex}`,
+      "B: the cut moves forward, never back to the span start",
+      cutIndex > 0,
+      `cut=${cutIndex}`,
     );
     check(
-      "B: no tail message is ever summarized",
-      [...tailTexts].every((text) => !summarizedTexts(calls).has(text)),
+      "B: everything the cut drops was summarized",
+      uncoveredOf(entries, compaction, calls).length === 0,
+      `${uncoveredOf(entries, compaction, calls).length} uncovered`,
     );
     clearSummarizer();
   }
@@ -847,6 +894,45 @@ section("13. split turn — the turn prefix is folded and merged");
     (compaction?.summary ?? "").includes("**Turn Context (split turn):**"),
   );
   check("the merged summary keeps both halves", (compaction?.summary ?? "").startsWith("summary-2"));
+  clearSummarizer();
+}
+
+// ---------------------------------------------------------------------------
+section("13c. split turn — a failed prefix summary keeps the prefix verbatim");
+{
+  const h = await load({ compactionFallbackChunkTokens: 1024 });
+  const calls = installSummarizer((record, n) => {
+    if (/PREFIX of a turn/.test(record.customInstructions ?? "")) {
+      throw new Error("prefix summarization rejected");
+    }
+    return { text: `summary-${n}`, usage: usageOf(100, 20) };
+  });
+  await failCompaction(h, 2);
+
+  const entries = buildSession({ count: 2, tokensEach: 1024 });
+  const event = compactEvent(entries, {
+    isSplitTurn: true,
+    turnPrefixMessages: [
+      { role: "user", content: [{ type: "text", text: "y".repeat(2048) }], timestamp: 1 },
+    ],
+  });
+  const compaction = compactionOf(await h.emit(event));
+
+  // A prefix-summary failure must not fail the whole fallback: the fold is
+  // simply incomplete, so the cut stays before the prefix and those messages
+  // are kept verbatim instead of being dropped.
+  check("the fallback still supplies a compaction", !!compaction, `${compaction?.summary?.slice(0, 20)}`);
+  check("no merge marker is emitted for the unsummarized prefix", !(compaction?.summary ?? "").includes("**Turn Context (split turn):**"));
+  check(
+    "the cut stays inside the summarized history, not at the host's cut",
+    (compaction?.firstKeptEntryId ?? "").startsWith("m"),
+    `${compaction?.firstKeptEntryId}`,
+  );
+  check(
+    "nothing is dropped without being summarized",
+    uncoveredOf(entries, compaction, calls).length === 0,
+    `${uncoveredOf(entries, compaction, calls).length}`,
+  );
   clearSummarizer();
 }
 
@@ -1012,6 +1098,153 @@ section("18. the fallback cannot re-enter itself");
   const out = await h.emit(compactEvent(buildSession({ count: 2, tokensEach: 1024 })));
   check("the nested event is refused", nested.every((r) => r === undefined));
   check("the outer fold still completes", Boolean(compactionOf(out)));
+  clearSummarizer();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 19 — replace, never stack
+// ════════════════════════════════════════════════════════════════════════
+section("19. the new summary replaces the previous one (never stacks)");
+{
+  // A previous fallback compaction cut early (fk=m6), so its summary sits in
+  // the path BEFORE the host's cut. The next fallback must cut AFTER that
+  // compaction entry: otherwise the old summary stays in the context and the
+  // new one is appended next to it — the context grows by a whole summary and
+  // the next turn overflows again (the compaction loop).
+  const entries = [];
+  for (let i = 0; i < 12; i++) {
+    entries.push(messageEntry(`m${i}`, i % 2 === 0 ? "user" : "assistant", 1024));
+  }
+  const prevKept = entries.findIndex((entry) => entry.id === "m6");
+  entries.push({
+    type: "compaction",
+    id: "c-prev",
+    parentId: entries[prevKept - 1].id,
+    timestamp: 1,
+    summary: "P".repeat(4000),
+    firstKeptEntryId: "m6",
+    tokensBefore: 999,
+    details: { source: "pi-vigilant-compaction-fallback", mechanism: "prefix-cut" },
+  });
+  for (let i = 0; i < 2; i++) entries.push(messageEntry(`k${i}`, "assistant", 128));
+
+  const cutIndex = entries.findIndex((entry) => entry.id === "k0");
+  const messagesToSummarize = [];
+  for (let i = prevKept; i < cutIndex; i++) {
+    const [first] = sessionEntryToContextMessages(entries[i]);
+    if (first) messagesToSummarize.push(first);
+  }
+  const event = {
+    type: "session_before_compact",
+    preparation: {
+      firstKeptEntryId: "k0",
+      messagesToSummarize,
+      turnPrefixMessages: [],
+      isSplitTurn: false,
+      tokensBefore: 4242,
+      previousSummary: undefined,
+      fileOps: {},
+      settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+    },
+    branchEntries: entries,
+    reason: "threshold",
+    willRetry: false,
+    signal: new AbortController().signal,
+  };
+
+  const h = await load({ compactionFallbackChunkTokens: 1024, maxCompactionFallbackChunks: 6 });
+  const calls = installSummarizer();
+  await failCompaction(h, 2);
+  const compaction = compactionOf(await h.emit(event));
+  const newCutIndex = entries.findIndex((entry) => entry.id === compaction?.firstKeptEntryId);
+  const prevCompIndex = entries.findIndex((entry) => entry.id === "c-prev");
+
+  check("a compaction is returned", Boolean(compaction));
+  check(
+    "the cut is after the previous compaction entry",
+    newCutIndex > prevCompIndex,
+    `cut=${newCutIndex} prevComp=${prevCompIndex}`,
+  );
+  check(
+    "everything the cut drops was summarized",
+    uncoveredOf(entries, compaction, calls).length === 0,
+    `${uncoveredOf(entries, compaction, calls).length} uncovered`,
+  );
+
+  // The post-compaction context renders exactly one compaction summary.
+  const after = [
+    ...entries,
+    {
+      type: "compaction",
+      id: "c-new",
+      parentId: entries[entries.length - 1].id,
+      timestamp: 2,
+      summary: compaction.summary,
+      firstKeptEntryId: compaction.firstKeptEntryId,
+      tokensBefore: compaction.tokensBefore,
+      details: compaction.details,
+    },
+  ];
+  const context = buildContextEntries(after, "c-new");
+  const summaries = context.filter((entry) => entry.type === "compaction");
+  check(
+    "the context holds exactly one compaction summary",
+    summaries.length === 1 && summaries[0].id === "c-new",
+    `${summaries.map((entry) => entry.id).join(",")}`,
+  );
+  const beforeEst = contextEstimate(entries);
+  const afterEst = contextEstimate(after);
+  check(
+    "the context actually shrank",
+    afterEst < beforeEst,
+    `${afterEst} < ${beforeEst}`,
+  );
+  clearSummarizer();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 20 — the fit guarantee
+// ════════════════════════════════════════════════════════════════════════
+section("20. the post-compaction context fits the real prompt limit");
+{
+  // The session is exhausted: tokensBefore is close to the real limit, so the
+  // measured ratio is high and the fit budget is tight. The fallback must cut
+  // deep enough that the conservative estimate of the post-compaction context
+  // stays under the limit — otherwise the retry is rejected again and the
+  // session dead-ends (the exact failure this fallback exists to prevent).
+  const entries = buildSession({ count: 10, tokensEach: 1024 });
+  const event = compactEvent(entries, {
+    tokensBefore: 160000,
+  });
+
+  const h = await load({ compactionFallbackChunkTokens: 1024, maxCompactionFallbackChunks: 6 });
+  const calls = installSummarizer();
+  await failCompaction(h, 2);
+  const compaction = compactionOf(
+    await h.emit(event, {
+      model: { id: "big", provider: "test", contextWindow: 168000, maxTokens: 32000 },
+    }),
+  );
+
+  check("a compaction is returned", Boolean(compaction));
+  const details = compaction?.details ?? {};
+  const summaryTokens = Math.ceil((compaction?.summary ?? "").length / 4);
+  const conservative = (details.suffixTokens ?? 0) + summaryTokens;
+  check(
+    "the conservative post-context fits the limit",
+    conservative * (details.fitRatio ?? 1) <= (details.fitLimitTokens ?? 0) + 1,
+    `${conservative} * ${details.fitRatio} <= ${details.fitLimitTokens}`,
+  );
+  check(
+    "everything the cut drops was summarized",
+    uncoveredOf(entries, compaction, calls).length === 0,
+    `${uncoveredOf(entries, compaction, calls).length} uncovered`,
+  );
+  check(
+    "the fit ratio is conservative (never below the floor)",
+    (details.fitRatio ?? 0) >= 1.75,
+    String(details.fitRatio),
+  );
   clearSummarizer();
 }
 

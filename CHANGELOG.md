@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-13
+
+### Fixed
+- **A compaction that succeeds but does not shrink the context no longer
+  dead-ends the session.** Reported from a real session where compaction kept
+  "working" while the retry kept being rejected: the fallback reported success
+  but *appended* its summary next to the previous one instead of replacing it,
+  so each compaction freed almost nothing and the loop continued until the
+  session gave up. Two causes, both fixed:
+  - **The cut could land on the previous compaction entry.** The new summary is
+    now placed strictly *after* the newest compaction entry on the path, so it
+    always supersedes the previous summary — the context can only shrink.
+  - **The fold stopped at half the span** and sized everything with Pi's
+    `chars / 4` estimate, which undercounts real tokens by 1.5–2.2× on
+    reasoning-heavy sessions. The fold now summarizes its whole budget, and the
+    cut is chosen so the post-compaction context fits the *real* prompt limit
+    (`contextWindow − maxOutput − 2048`, with the real/estimate ratio measured
+    from the host's own anchored usage and clamped to 1.75–3×). Whatever the
+    fit pushes past the summarized region is summarized too — or the summary
+    says explicitly that it was dropped.
+- **The context-pressure cap could block the last-resort fallback entirely.**
+  After two context-overflow turns, `maxContextPressureCompactions` set a flag
+  that also gated the fallback's retry, so the fallback never ran and the
+  session dead-ended with "Context remains exhausted after automatic
+  compaction." The cap (and its cooldown) now only stop pi-vigilant's *own*
+  recovery; the fallback's own `maxCompactionFallbackAttempts` bounds the loop.
+  That budget resets when a turn completes normally — not on a successful
+  compaction, which the host reports even when the real context still
+  overflows.
+- **A failed split-turn prefix summary no longer fails the whole fallback.**
+  The fold is marked incomplete instead, so the cut stays before the prefix and
+  those messages are kept verbatim rather than dropped unsummarized.
+
+### Added
+- `details.fitRatio`, `details.suffixTokens`, `details.fitLimitTokens` and
+  `details.uncoveredTokens` on fallback compaction entries record how the cut
+  was chosen and what the fit cost.
+
+### Changed
+- Mechanism B (prefix-cut) now moves the cut *later* than the host's own cut
+  when the fit requires it. Previously the cut could only move earlier, which is
+  why an over-limit context could not be repaired by a partial compaction.
+
 ## [0.4.0] - 2026-09-12
 
 ### Added

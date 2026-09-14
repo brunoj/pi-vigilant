@@ -218,11 +218,30 @@ destructive one, and the last rung always works:
   `compactionFallbackDropOnly: false` if you would rather be told to run
   `/compact` manually than lose context.
 
-The recent tail is never touched. Pi's cut point is the boundary of the last
-`keepRecentTokens` — everything from there on is kept verbatim — and every
-mechanism above only ever moves the cut *earlier*, never past it. A partial
-compaction therefore keeps strictly more than the standard compactor would; it
-never summarizes or drops the messages Pi itself would have kept.
+The recent tail is protected. Pi's cut point is the boundary of the last
+`keepRecentTokens` — everything from there on is kept verbatim — and the fold
+mechanisms keep that boundary. Only the fit guarantee may move the cut past it:
+a context that still overflows after a compaction is the loop this exists to
+break, so when the tail alone cannot fit the prompt, the cut moves into it — and
+the messages it moves past are summarized by one more request first. Nothing is
+ever dropped without a summary.
+
+Two guarantees make the result trustworthy rather than merely successful:
+
+- **The new summary replaces the previous one.** The cut is placed strictly
+  after the newest compaction entry on the session path, so an earlier summary
+  leaves the context instead of being stacked next to the new one. Without this
+  a "successful" compaction can free almost nothing and the session compacts
+  forever.
+- **The result fits the model's real limit.** The cut is chosen so the
+  post-compaction prompt fits `contextWindow − maxOutput − 2048`, using a
+  conservative estimate calibrated against the host's own anchored token count
+  (real prompts run 1.5–2.2× above Pi's `chars / 4` estimate on
+  reasoning-heavy sessions). If fitting requires cutting past the region the
+  fold summarized, that region is summarized too — or the summary says
+  explicitly that it was dropped, and `details.uncoveredTokens` records how
+  much. A compaction that "succeeds" while leaving the context over the limit
+  is not a success: it is the loop this exists to break.
 
 The slice size adapts to the model: it is raised to cover the span within the
 chunk budget when the window allows, and clamped both to what the model can
@@ -236,7 +255,13 @@ Ownership rules that keep it safe:
 - It never calls `ctx.compact()` — it only supplies a compaction when the host
   asks for one, so it cannot race the host or double-compact.
 - Attempts are capped (`maxCompactionFallbackAttempts`, default 3). When the cap
-  is reached the extension stops and says so instead of burning requests.
+  is reached the extension stops and says so instead of burning requests. The
+  budget resets when a turn completes normally — the proof the context fits
+  again — not on a successful compaction, which the host can report even while
+  the real context still overflows. The context-pressure cap
+  (`maxContextPressureCompactions`) and its cooldown never block this last
+  resort: they bound pi-vigilant's own recovery, and blocking the fallback there
+  is exactly the dead end it exists to prevent.
 - A provider outage does not dead-end the session: if the first slice cannot be
   summarized, the drop-only rung removes the oldest part of the span so the
   session can continue once the provider is back. Nothing in this path calls the

@@ -249,33 +249,68 @@ section("4 — context nearly full + non-overflow error: no continuation, retry 
 }
 
 // ---------------------------------------------------------------------------
-section("5 — cap: maxContextPressureCompactions=1 stops after one compact");
+section("5 — the last-resort fallback is bounded by its own budget, not the cap");
 // ---------------------------------------------------------------------------
 {
-  const ext = extWithConfig({ maxContextPressureCompactions: 1 });
+  // maxContextPressureCompactions caps pi-vigilant's own recovery, but the
+  // compaction fallback is the last resort: blocking it there would dead-end
+  // the session (the one outcome the fallback exists to prevent). Its own
+  // attempt budget is what stops a compact → overflow → compact loop.
+  const ext = extWithConfig({
+    maxContextPressureCompactions: 1,
+    maxCompactionFallbackAttempts: 2,
+  });
   const { emit, sent, queue, compacted, notifications } = await loadExtension(ext);
   const llm = [{ role: "user", content: "Fix the auth bug.", timestamp: 1 }];
   const ctx = { model: { contextWindow: 168000 } };
+
+  // Episode 1: the cap is already reached, but the fallback still recovers.
   await startRun(emit, queue, llm, ctx);
   await emit({ type: "agent_end", messages: [overflowError()] }, ctx);
   await hostOverflowRecovery(emit, ctx);
   await settleWithRetry(emit, ctx);
   check("first overflow compacts", compacted.length === 1, `${compacted.length}`);
 
-  // Second overflow: the budget is exhausted — no compact, operator warned.
+  // Episode 2: same again — the cap does not stop the last resort.
   await startRun(emit, queue, llm, ctx);
   await emit({ type: "agent_end", messages: [overflowError()] }, ctx);
   await hostOverflowRecovery(emit, ctx);
   await settleWithRetry(emit, ctx);
-  check("second overflow does not compact again", compacted.length === 1, `${compacted.length}`);
-  check("operator warned about the exhausted context", capNotices(notifications).length === 1, `${capNotices(notifications).length}`);
-  check("no second continuation queued (cap stops the retry)", errorContinuations(sent).length === 1, `${errorContinuations(sent).length}`);
+  check(
+    "the cap never blocks the last-resort fallback",
+    compacted.length === 2,
+    `${compacted.length}`,
+  );
+  check(
+    "the cap message is not shown while the fallback can still run",
+    capNotices(notifications).length === 0,
+    `${capNotices(notifications).length}`,
+  );
+
+  // Episode 3: the fallback's own budget is spent — now it stops, and says so.
+  await startRun(emit, queue, llm, ctx);
+  await emit({ type: "agent_end", messages: [overflowError()] }, ctx);
+  await hostOverflowRecovery(emit, ctx);
+  await settleWithRetry(emit, ctx);
+  check(
+    "the fallback's budget stops the loop",
+    compacted.length === 2,
+    `${compacted.length}`,
+  );
+  check(
+    "the operator is told the fallback gave up",
+    notifications.some((n) => /already ran 2× without success/.test(n.message)),
+    notifications.map((n) => n.message.slice(0, 40)).join(" | "),
+  );
 }
 
 // ---------------------------------------------------------------------------
-section("6 — cooldown: two overflows < 60s apart compact once");
+section("6 — cooldown: two overflows < 60s apart still both recover");
 // ---------------------------------------------------------------------------
 {
+  // The cooldown spaces out pi-vigilant's own compaction attempts. It must not
+  // block the fallback either: a second overflow moments later still needs the
+  // bounded-slice summary, otherwise the session dead-ends.
   const { emit, sent, queue, compacted, notifications } = await loadExtension(EXT);
   const llm = [{ role: "user", content: "Fix the auth bug.", timestamp: 1 }];
   const ctx = { model: { contextWindow: 168000 } };
@@ -289,9 +324,16 @@ section("6 — cooldown: two overflows < 60s apart compact once");
   await emit({ type: "agent_end", messages: [overflowError()] }, ctx);
   await hostOverflowRecovery(emit, ctx);
   await settleWithRetry(emit, ctx);
-  check("second overflow within cooldown does not compact", compacted.length === 1, `${compacted.length}`);
-  check("operator told about the cooldown", cooldownNotices(notifications).length === 1, `${cooldownNotices(notifications).length}`);
-  check("no second continuation queued (cooldown stops the retry)", errorContinuations(sent).length === 1, `${errorContinuations(sent).length}`);
+  check(
+    "a second overflow inside the cooldown still recovers",
+    compacted.length === 2,
+    `${compacted.length}`,
+  );
+  check(
+    "the cooldown message is not shown while the fallback can still run",
+    cooldownNotices(notifications).length === 0,
+    `${cooldownNotices(notifications).length}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
