@@ -74,7 +74,10 @@ Run `/reload` (or restart pi) after installing.
   "loopStallCalls": 24,
   "loopStallRepeatRatio": 0.5,
   "loopSteerMax": 2,
-  "loopCooldownMs": 90000
+  "loopCooldownMs": 90000,
+
+  "toolTimeoutEnforcement": true,
+  "toolTimeoutCeilingSeconds": 1800
 }
 ```
 
@@ -96,6 +99,7 @@ Run `/reload` (or restart pi) after installing.
 | `capture_feedback` | Capture behavior criticism (project/global) |
 | `resolve_feedback` | Mark a feedback item resolved |
 | `get_feedback_checkpoints` | Compiled, categorized checkpoints |
+| `set_next_tool_timeout` | Raise the timeout ceiling for the next shell call (one-shot) |
 | `/clear-specs` | User-only: archive current spec task + start fresh |
 | `/clear-feedback` | User-only: clear all feedback |
 
@@ -311,3 +315,37 @@ halted run.
   does **not** reset — it is the same task.
 - `loopGuardian: false` disables the whole mechanism.
 - Text-only loops (no tool calls) are out of scope for v1.
+
+## Tool-call timeout enforcement
+
+A tool call must never be allowed to hang for hours. Shell tools (`bash`,
+`powershell`) accept an optional `timeout` in seconds; pi-vigilant heeds the
+tool's own timeout setting and applies an implicit maximum:
+
+- **No timeout set** → the ceiling is injected (`toolTimeoutCeilingSeconds`,
+  default 1800 = 30 min), so the host's own timeout mechanism kills the
+  process tree and the agent gets a `Command timed out after N seconds` error
+  instead of hanging.
+- **Timeout above the ceiling** → clamped down to the ceiling, with a warning
+  notification.
+- **Timeout within the ceiling** → left untouched.
+- **Non-shell tools** (`read`, `write`, `edit`, `grep`, `find`, `ls`, custom
+  tools) are never touched — they carry no timeout parameter of their own and
+  are local operations that don't hang for 30 minutes.
+
+### Raising the ceiling for one call
+
+When a shell command legitimately needs more than 30 minutes (a long build, a
+big download), call `set_next_tool_timeout` immediately before it:
+
+```
+set_next_tool_timeout(seconds: 3600)
+```
+
+The override is **one-shot**: it applies to the very next `bash`/`powershell`
+call (non-shell calls don't consume it) and then reverts to the default
+ceiling. It is capped at 86400s (24h) so a typo can't turn the ceiling into a
+multi-day hang.
+
+- `toolTimeoutEnforcement: false` disables the whole mechanism.
+- `toolTimeoutCeilingSeconds: 0` disables injection (no implicit maximum).

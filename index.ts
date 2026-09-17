@@ -182,6 +182,17 @@ interface ExtensionConfig {
   loopSteerMax: number;
   /** Minimum gap between interventions, in ms. */
   loopCooldownMs: number;
+  /**
+   * A tool call must never be allowed to hang forever. Shell tools (bash,
+   * powershell) accept an optional `timeout` (seconds); when the agent omits
+   * it, we inject the ceiling so the host's own timeout/process-tree-kill
+   * mechanism enforces it. When the agent supplies a timeout above the
+   * ceiling, it is clamped down — unless the one-shot TTL tool raised the
+   * ceiling for this specific call.
+   */
+  toolTimeoutEnforcement: boolean;
+  /** Implicit maximum for any tool call that doesn't set its own timeout, in seconds. */
+  toolTimeoutCeilingSeconds: number;
 }
 
 function loadConfig(): ExtensionConfig {
@@ -283,6 +294,11 @@ function loadConfig(): ExtensionConfig {
           parsed.loopCooldownMs,
           DEFAULT_LOOP_COOLDOWN_MS,
         ),
+        toolTimeoutEnforcement: parsed.toolTimeoutEnforcement !== false,
+        toolTimeoutCeilingSeconds: normalizeCount(
+          parsed.toolTimeoutCeilingSeconds,
+          DEFAULT_TOOL_TIMEOUT_CEILING_SECONDS,
+        ),
       };
     }
   } catch {
@@ -322,6 +338,8 @@ function loadConfig(): ExtensionConfig {
     loopStallRepeatRatio: DEFAULT_LOOP_STALL_REPEAT_RATIO,
     loopSteerMax: DEFAULT_LOOP_STEER_MAX,
     loopCooldownMs: DEFAULT_LOOP_COOLDOWN_MS,
+    toolTimeoutEnforcement: true,
+    toolTimeoutCeilingSeconds: DEFAULT_TOOL_TIMEOUT_CEILING_SECONDS,
   };
 }
 
@@ -433,6 +451,21 @@ const DEFAULT_LOOP_STALL_CALLS = 24;
 const DEFAULT_LOOP_STALL_REPEAT_RATIO = 0.5;
 const DEFAULT_LOOP_STEER_MAX = 2;
 const DEFAULT_LOOP_COOLDOWN_MS = 90_000;
+
+// ---------------------------------------------------------------------------
+// Tool-call timeout enforcement defaults
+// ---------------------------------------------------------------------------
+
+/** Implicit maximum for any tool call that doesn't declare its own timeout. */
+const DEFAULT_TOOL_TIMEOUT_CEILING_SECONDS = 1800;
+/** Shell tools whose native `timeout` field (seconds) we can inject/clamp. */
+const TIMEOUT_CAPABLE_TOOLS = new Set(["bash", "powershell"]);
+/**
+ * Hard cap for the one-shot TTL override. Prevents a typo (e.g. 36000 instead
+ * of 3600) from turning a 30-minute ceiling into a multi-day hang. 24h is far
+ * beyond any legitimate single tool call in an agent session.
+ */
+const TOOL_TIMEOUT_TTL_MAX_SECONDS = 86_400;
 
 /**
  * customTypes this extension queues. The context filter only ever considers
@@ -920,6 +953,12 @@ interface ContinuationState {
   currentTaskPath?: string;
   /** Title of current task (first spec's context). */
   currentTaskTitle?: string;
+  /**
+   * One-shot ceiling override (seconds) for the NEXT tool call only, set by
+   * the set_next_tool_timeout tool. Consumed (reset to undefined) the moment
+   * a tool_call event is handled, whether or not that tool is timeout-capable.
+   */
+  nextToolTimeoutCeilingSeconds?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,6 +1244,126 @@ export default function (pi: ExtensionAPI): void {
     // A compaction succeeded: the context is fresh again, so the cap/cooldown
     // block on further overflow recovery no longer applies.
     state.overflowRetryBlocked = false;
+  });
+
+  // ======================================================================
+  // TOOL-CALL TIMEOUT ENFORCEMENT
+  //
+  // A tool call must never be allowed to hang for hours. Shell tools (bash,
+  // powershell) accept an optional `timeout` in seconds; when the agent omits
+  // it we inject the ceiling so the host's own timeout/process-tree-kill
+  // mechanism enforces it, and when the agent sets a timeout above the
+  // ceiling we clamp it down. The one-shot TTL tool (set_next_tool_timeout)
+  // lets the agent raise the ceiling for exactly one shell call that
+  // legitimately needs longer.
+  // ======================================================================
+
+  pi.on(
+    "tool_call",
+    (
+      event: {
+        toolName: string;
+        input: Record<string, unknown>;
+      },
+      ctx: ExtensionContext,
+    ) => {
+      if (!config.toolTimeoutEnforcement) return;
+      if (!TIMEOUT_CAPABLE_TOOLS.has(event.toolName)) return;
+
+      // One-shot: the TTL override applies to the next shell call only.
+      const ceiling =
+        state.nextToolTimeoutCeilingSeconds ??
+        config.toolTimeoutCeilingSeconds;
+      state.nextToolTimeoutCeilingSeconds = undefined;
+      if (!(ceiling > 0)) return;
+
+      const input = event.input as { command: string; timeout?: unknown };
+      const current = input.timeout;
+      if (
+        typeof current !== "number" ||
+        !Number.isFinite(current) ||
+        current <= 0
+      ) {
+        // No usable timeout: apply the implicit maximum.
+        input.timeout = ceiling;
+      } else if (current > ceiling) {
+        // Explicit timeout above the ceiling: clamp it down.
+        input.timeout = ceiling;
+        try {
+          ctx.ui?.notify?.(
+            `Tool call "${event.toolName}" requested a ${current}s timeout; ` +
+              `clamped to the ${ceiling}s ceiling. Use set_next_tool_timeout ` +
+              `to raise it for one call.`,
+            "warning",
+          );
+        } catch {
+          // Notification is best-effort (e.g. no UI in print mode).
+        }
+      }
+    },
+  );
+
+  // ── set_next_tool_timeout ────────────────────────────────────────────
+  pi.registerTool({
+    name: "set_next_tool_timeout",
+    label: "Set Next Tool Timeout",
+    description:
+      "Raise the timeout ceiling for the NEXT shell tool call (bash/powershell) only. " +
+      "By default every tool call is capped at 1800s (30 min): a call without its own " +
+      "timeout gets 1800s injected, and a call with a longer timeout is clamped down. " +
+      "Call this immediately before a shell command that legitimately needs longer than " +
+      "30 minutes; the raised ceiling applies to exactly the next shell call and then " +
+      "reverts to the default. The override is one-shot and non-persistent (max 86400s).",
+    promptSnippet: "Raise the next shell call's timeout ceiling above 30 min (one-shot)",
+    promptGuidelines: [
+      "Use set_next_tool_timeout only when a shell command genuinely needs more than 30 minutes (e.g. a long build, a big download). Call it immediately before the bash call it applies to.",
+      "The override is one-shot: it applies to the very next bash/powershell call and then reverts to the 1800s default. Do not call it for ordinary commands.",
+    ],
+    parameters: Type.Object({
+      seconds: Type.Number({
+        description:
+          "Timeout ceiling in seconds for the next shell call (e.g. 3600 for 1 hour). Must be positive and at most 86400 (24h).",
+      }),
+    }),
+    async execute(
+      _toolCallId: string,
+      params: { seconds: number },
+      _signal: AbortSignal,
+      _onUpdate:
+        | ((update: { content: { type: string; text: string }[] }) => void)
+        | undefined,
+      _ctx: ExtensionContext,
+    ) {
+      if (
+        typeof params.seconds !== "number" ||
+        !Number.isFinite(params.seconds) ||
+        params.seconds <= 0
+      ) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Invalid seconds: ${String(params.seconds)}. Must be a positive finite number.`,
+            },
+          ],
+        };
+      }
+      const clamped = Math.min(
+        Math.floor(params.seconds),
+        TOOL_TIMEOUT_TTL_MAX_SECONDS,
+      );
+      state.nextToolTimeoutCeilingSeconds = clamped;
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `The next shell tool call (bash/powershell) will use a ${clamped}s timeout ceiling ` +
+              `(one-shot; reverts to the ${config.toolTimeoutCeilingSeconds}s default after it).`,
+          },
+        ],
+      };
+    },
   });
 
   // ======================================================================

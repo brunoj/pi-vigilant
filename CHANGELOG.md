@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-13
+
+### Added
+- **Tool-call timeout enforcement.** A tool call can no longer hang for hours.
+  Shell tools (`bash`, `powershell`) accept an optional `timeout` in seconds;
+  pi-vigilant now heeds the tool's own timeout setting and applies an implicit
+  maximum:
+  - a call with **no timeout** gets the ceiling injected
+    (`toolTimeoutCeilingSeconds`, default 1800 = 30 min), so the host's own
+    timeout mechanism kills the process tree and the agent receives a
+    `Command timed out after N seconds` error instead of hanging;
+  - a call with a **timeout above the ceiling** is clamped down (with a warning
+    notification);
+  - a call with a **timeout within the ceiling** is left untouched;
+  - non-shell tools are never touched (they carry no timeout parameter and are
+    local operations that don't hang for 30 minutes).
+- **`set_next_tool_timeout` tool (one-shot TTL).** The agent can raise the
+  ceiling for exactly one shell call that legitimately needs longer than 30
+  minutes: `set_next_tool_timeout(seconds: 3600)` applies to the very next
+  `bash`/`powershell` call (non-shell calls don't consume it) and then reverts
+  to the default ceiling. Capped at 86400s (24h) so a typo can't turn the
+  ceiling into a multi-day hang.
+
+### Configuration
+- `toolTimeoutEnforcement` (default `true`) — disable the whole mechanism.
+- `toolTimeoutCeilingSeconds` (default `1800`) — implicit maximum in seconds;
+  `0` disables injection.
+
 ## [0.5.0] - 2026-09-13
 
 ### Fixed

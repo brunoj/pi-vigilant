@@ -5,7 +5,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$HERE/setup.sh" >/dev/null || { echo "setup failed"; exit 1; }
 
 fail=0
-for t in test-regression.mjs test-stale.mjs test-resume.mjs test-length-loop.mjs test-compaction-fallback.mjs test-loop-guardian.mjs test-context-overflow.mjs; do
+for t in test-regression.mjs test-stale.mjs test-resume.mjs test-length-loop.mjs test-compaction-fallback.mjs test-loop-guardian.mjs test-context-overflow.mjs test-tool-timeout.mjs; do
   echo "── $t ─────────────────────────────────────────"
   # Bounded: the suites are pure in-process simulation and finish in seconds.
   if timeout 300 node "$HERE/$t"; then :; else fail=1; fi
