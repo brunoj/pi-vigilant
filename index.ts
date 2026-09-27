@@ -690,6 +690,16 @@ const COMPACTION_CONTINUATION_PROMPT = `Continue working on the user's current t
 
 const PREMATURE_STOP_PROMPT = `Your previous response appears to have stopped prematurely — it ends mid-sentence or mid-thought. Continue exactly where you left off and finish what you were about to do. Do not repeat the completed portion. If you were about to call a tool, call it now. If you were explaining something, finish the explanation. Keep working through clear next steps; if the task is actually complete, provide the final result.`;
 
+/**
+ * Sent when the host's own auto-retry budget is exhausted on a retryable
+ * provider error (the TUI shows "Retry failed after N attempts: ..."). The
+ * interrupted message never completed, so none of its tool calls were
+ * executed. The model must resume from the actual state of the work instead of
+ * re-reading the user's request as if starting over — the generic
+ * "re-read and try again" instruction invites a full restart of the task.
+ */
+const HOST_RETRY_EXHAUSTED_PROMPT = `Your previous response was interrupted by a transient provider error and the host's automatic retries were exhausted. The interrupted response never completed, so none of its tool calls were executed. Re-read the user's most recent request, inspect the current state of the work (files written and tool results from earlier turns), and continue exactly from the point of interruption. Do not restart the task from the beginning and do not repeat completed work.`;
+
 // ---------------------------------------------------------------------------
 // Feedback Memory — types and helpers
 // ---------------------------------------------------------------------------
@@ -915,6 +925,8 @@ interface ContinuationState {
   consecutiveFailures: number;
   /** Continuations queued during the current failure streak (bounded by config). */
   failureContinuationsQueued: number;
+  /** Whether the host-retry-exhaustion notice has been shown in the current streak. */
+  hostRetryExhaustionNotified: boolean;
   /** Consecutive output-length continuations since the last real progress. */
   lengthContinuationsQueued: number;
   /** Consecutive context-starved length stops. */
@@ -1141,6 +1153,7 @@ export default function (pi: ExtensionAPI): void {
     epoch: 0,
     consecutiveFailures: 0,
     failureContinuationsQueued: 0,
+    hostRetryExhaustionNotified: false,
     lengthContinuationsQueued: 0,
     starvedLengthStreak: 0,
     contextPressureCompactionsQueued: 0,
@@ -2211,38 +2224,49 @@ export default function (pi: ExtensionAPI): void {
   });
 
   /**
-   * Record a failed turn and decide whether to queue a continuation for it.
+   * Decide whether pi-vigilant should queue an error continuation for the
+   * current agent_end, and whether the host's own retry budget is already
+   * exhausted.
    *
-   * Returns false when the continuation should be skipped, either because Pi's
-   * own retry layer is still working on it or because this failure streak has
-   * already produced its budget of continuations.
+   * Returns `queue: false` when the continuation should be skipped, either
+   * because Pi's own retry layer is still working on it or because this
+   * failure streak has already produced its budget of continuations.
    *
    * `assistant` is undefined when the provider produced no message at all.
+   *
+   * The host retries retryable errors internally (one `agent_end` per attempt),
+   * so `consecutiveFailures` counts attempts, not episodes: the first
+   * `hostRetryBudget` failures are the host's, and the next one is the
+   * exhaustion signal. `hostExhausted` is true exactly when pi-vigilant is
+   * stepping in after the host gave up — the caller then uses the state-aware
+   * instruction instead of the generic one.
    */
   function shouldQueueFailureContinuation(
     assistant: AssistantMessage | undefined,
-  ): boolean {
+  ): { queue: boolean; hostExhausted: boolean } {
     state.consecutiveFailures++;
 
     // Layer 1 — leave the first N retryable failures to Pi's retry machinery.
     // Extensions don't receive `willRetry` on agent_end, so the host's budget is
     // mirrored rather than observed: defer while within it, then step in.
+    const retryable =
+      assistant !== undefined && isRetryableAssistantError(assistant);
+    const hostExhausted =
+      retryable && state.consecutiveFailures > config.hostRetryBudget;
     const hostMayStillRetry =
-      assistant !== undefined &&
-      isRetryableAssistantError(assistant) &&
-      state.consecutiveFailures <= config.hostRetryBudget;
-    if (hostMayStillRetry) return false;
+      retryable && state.consecutiveFailures <= config.hostRetryBudget;
+    if (hostMayStillRetry) return { queue: false, hostExhausted: false };
 
     // Layer 2 — circuit breaker. Bound the cost of a long outage to a constant.
     if (
       state.failureContinuationsQueued >=
       config.maxConsecutiveFailureContinuations
     ) {
-      return false;
+      return { queue: false, hostExhausted };
     }
 
     state.failureContinuationsQueued++;
-    return true;
+    return { queue: true, hostExhausted };
   }
 
   /**
@@ -2349,6 +2373,7 @@ export default function (pi: ExtensionAPI): void {
     }
     state.consecutiveFailures = 0;
     state.failureContinuationsQueued = 0;
+    state.hostRetryExhaustionNotified = false;
   }
 
   // ── Compaction fallback ───────────────────────────────────────────────
@@ -3241,7 +3266,7 @@ export default function (pi: ExtensionAPI): void {
     if (!assistant) {
       if (ctx.hasPendingMessages()) return;
       state.lastResponseConclusive = false;
-      if (!shouldQueueFailureContinuation(undefined)) return;
+      if (!shouldQueueFailureContinuation(undefined).queue) return;
       state.continuationSinceLastVerification = true;
       try {
         pi.sendMessage(
@@ -3531,13 +3556,30 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
 
-      if (!shouldQueueFailureContinuation(assistant)) return;
+      const decision = shouldQueueFailureContinuation(assistant);
+      if (!decision.queue) return;
       state.continuationSinceLastVerification = true;
+      // When the host's own auto-retry budget is exhausted (the TUI shows
+      // "Retry failed after N attempts: ..."), the interrupted message never
+      // completed, so none of its tool calls were executed. The continuation
+      // must say so and point the model at the real state of the work; the
+      // generic "re-read and try again" instruction invites a restart.
+      let content = `Your previous response stopped due to an error. Please re-read the user's last message and try again. Do not repeat completed work from earlier turns.`;
+      if (decision.hostExhausted) {
+        content = HOST_RETRY_EXHAUSTED_PROMPT;
+        if (!state.hostRetryExhaustionNotified) {
+          state.hostRetryExhaustionNotified = true;
+          ctx.ui.notify(
+            `The provider's automatic retries were exhausted (${config.hostRetryBudget} attempts) on a transient error. Resuming the interrupted turn automatically.`,
+            "warning",
+          );
+        }
+      }
       try {
         pi.sendMessage(
           {
             customType: "auto-continue-error",
-            content: `Your previous response stopped due to an error. Please re-read the user's last message and try again. Do not repeat completed work from earlier turns.`,
+            content,
             display: false,
             details: {
               kind: "error_continuation",

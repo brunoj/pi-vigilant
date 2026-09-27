@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-27
+
+### Fixed
+- **Host-retry exhaustion is now resumed with a state-aware instruction.** When
+  the host's own auto-retry budget is exhausted on a retryable provider error
+  (the TUI shows `Retry failed after N attempts: ...`, e.g. `terminated`), the
+  continuation pi-vigilant queues now tells the model that the interrupted
+  response never completed and that none of its tool calls were executed, and
+  points it at the real state of the work (files written, tool results from
+  earlier turns) so it continues from the point of interruption instead of
+  re-reading the user's request as if starting over.
+- **Operator notice on exhaustion.** When pi-vigilant steps in after the host
+  gave up, it notifies the operator once per failure streak that the session is
+  resuming automatically, so the `Retry failed` error is not mistaken for a
+  dead session.
+
 ## [0.6.0] - 2026-09-13
 
 ### Added
