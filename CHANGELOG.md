@@ -11,7 +11,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- (describe changes for 0.6.2)
+- **Completeness guard at final verification** — newer models increasingly settle
+  for work that *looks* finished: a function whose body is a placeholder, a screen
+  populated with invented records, a report citing a limit nobody checked. Green
+  tests do not disprove it, because the tests were written against the stub. At
+  completion the extension now scans the files this session changed for stub,
+  fabricated-data and unverified-fact markers (`TODO`, `not implemented`, `coming
+  soon`, lorem ipsum, `example.com`, placeholder people/phones, `TBD`, `???`,
+  `YOUR_API_KEY`, …) and injects the concrete `file:line` evidence into the
+  verification prompt.
+- **The call-out is unconditional.** Findings variant (the evidence), scan-failure
+  variant (says plainly that the deliverable could not be checked — never implies a
+  check that did not happen), or a clean-scan variant that still asks the two
+  questions a scan cannot answer: was anything asked-for silently deferred, and is
+  every part wired to a user-reachable entry point? Built-but-never-wired is the
+  stub no marker reveals.
+- **Finish it, or say so.** The agent must either complete the work or state the
+  discrepancy to the user — what is missing, why, what remains. A stub or
+  placeholder is legitimate only when the user asked for exactly that, and then it
+  is declared out loud, never left silent.
+- **Changed files, not the whole repo.** Git baseline diff (captured at session
+  start) plus the current worktree, so work the agent already committed is still
+  covered — the ASF commits per phase, so the tree is clean exactly when
+  verification runs; outside git, files modified since the session started. Tests,
+  fixtures, docs, dependencies and generated code are excluded (mocks at a test
+  seam are correct practice), findings are capped and the cap is disclosed.
+- Config: `completenessGuard` (default `true`), `completenessMaxFindings` (default
+  25). The guard never blocks a run — it is prompt-based.
+- New suite `test/test-completeness.mjs` (35 checks): what the scanner catches,
+  what it must not flag (`placeholder="Search"`, clean source), what it excludes,
+  that capping and scan failures are disclosed, and that the completion hook
+  injects real findings — including stub work the agent already committed.
+
+Pairs with the ASF-side rule `aia-asf` `references/06i-completeness.md` (P24).
 
 
 ## [0.6.1] - 2026-09-27
