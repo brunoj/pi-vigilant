@@ -60,6 +60,7 @@ import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { LoopGuardian, type LoopGuardianConfig } from "./lib/loop-guardian";
+import { auditCompleteness, currentRevision, type CompletenessAudit } from "./lib/completeness";
 
 /**
  * `session_compact_failed` payload. Declared locally because the host's root
@@ -113,6 +114,14 @@ interface ExtensionConfig {
   lengthStopContinuation: boolean;
   compactionContinuation: boolean;
   finalVerification: boolean;
+  /**
+   * Completeness guard: at final verification, scan the files this session
+   * changed for stub / fabricated-data / unverified-fact markers and put the
+   * findings in front of the agent, so "done" cannot mean "stubbed".
+   */
+  completenessGuard: boolean;
+  /** Cap on findings injected per verification (bounded, 06b Rule 15). */
+  completenessMaxFindings: number;
   feedbackMemoryIntegration: boolean;
   specMemoryIntegration: boolean;
   /** Drop continuations from a past epoch out of the LLM context (see epoch below). */
@@ -210,6 +219,11 @@ function loadConfig(): ExtensionConfig {
           parsed.compactionContinuation !== false,
         finalVerification:
           parsed.finalVerification !== false,
+        completenessGuard: parsed.completenessGuard !== false,
+        completenessMaxFindings: normalizeCount(
+          parsed.completenessMaxFindings,
+          DEFAULT_COMPLETENESS_MAX_FINDINGS,
+        ),
         feedbackMemoryIntegration:
           parsed.feedbackMemoryIntegration !== false,
         specMemoryIntegration:
@@ -309,6 +323,8 @@ function loadConfig(): ExtensionConfig {
     lengthStopContinuation: true,
     compactionContinuation: true,
     finalVerification: true,
+    completenessGuard: true,
+    completenessMaxFindings: DEFAULT_COMPLETENESS_MAX_FINDINGS,
     feedbackMemoryIntegration: true,
     specMemoryIntegration: true,
     staleContinuationFiltering: true,
@@ -379,6 +395,8 @@ const DEFAULT_MAX_CONSECUTIVE_FAILURE_CONTINUATIONS = 3;
 
 /** Default assumed host retry budget (Pi's `retry.maxRetries` default is 3). */
 const DEFAULT_HOST_RETRY_BUDGET = 3;
+/** Findings injected into one verification prompt — enough to act on, small enough to ignore nothing. */
+const DEFAULT_COMPLETENESS_MAX_FINDINGS = 25;
 
 /** §5.1 — output-length continuation loop bounds (see Case 1 in agent_end). */
 const DEFAULT_LENGTH_CONTINUATION_MAX_CONSECUTIVE = 3;
@@ -959,6 +977,14 @@ interface ContinuationState {
   taskToolCallCount: number;
   /** Total tool calls across the entire session (for complexity heuristics). */
   sessionTotalToolCalls: number;
+  /**
+   * Commit HEAD was at when this session started. Diffing it against HEAD at
+   * completion covers work the agent already committed (the ASF commits per
+   * phase, so the working tree is often clean exactly when it is time to verify).
+   */
+  completenessBaseline: string | null;
+  /** Wall-clock session start, for the non-git mtime fallback. */
+  sessionStartMs: number;
   /** Current active task ID for spec-memory. */
   currentTaskId?: string;
   /** Path to current task file. */
@@ -1170,6 +1196,8 @@ export default function (pi: ExtensionAPI): void {
     lastRunToolCallCount: 0,
     taskToolCallCount: 0,
     sessionTotalToolCalls: 0,
+    completenessBaseline: null,
+    sessionStartMs: Date.now(),
     currentTaskId: undefined,
     currentTaskPath: undefined,
     currentTaskTitle: undefined,
@@ -2208,6 +2236,11 @@ export default function (pi: ExtensionAPI): void {
     state.prematureQueued = false;
     state.lastRunToolCallCount = 0;
     state.lastResponseConclusive = true;
+    // Capture the completeness baseline once: the diff against this commit is
+    // what the completion guard scans, so committed work is covered too.
+    if (config.completenessGuard && state.completenessBaseline === null) {
+      state.completenessBaseline = currentRevision(process.cwd());
+    }
     // lastVerificationTime and continuationSinceLastVerification are NOT
     // reset here — they persist across runs within the same session.
 
@@ -4025,6 +4058,67 @@ export default function (pi: ExtensionAPI): void {
           task.verificationSentAt = new Date().toISOString();
           saveSpecTask(currentFile, task);
         }
+      }
+    }
+
+    // ── Completeness guard: is the deliverable real? ─────────────────
+    // "Done" must not mean "stubbed". The agent is ALWAYS confronted with this —
+    // with the concrete evidence when the scan finds markers, and with the two
+    // questions a scan cannot answer when it does not. Either the work is
+    // finished, or the gap is stated to the user; never silently accepted.
+    if (config.completenessGuard) {
+      let audit: CompletenessAudit | undefined;
+      try {
+        audit = auditCompleteness(process.cwd(), {
+          baselineRef: state.completenessBaseline ?? undefined,
+          sinceMs: state.sessionStartMs,
+          maxFindings: config.completenessMaxFindings,
+        });
+      } catch (e) {
+        // A scan that blows up must not read as a clean deliverable.
+        audit = {
+          findings: [],
+          scannedFiles: 0,
+          source: "none",
+          truncated: false,
+          text: "",
+          error: `scan failed: ${e instanceof Error ? e.message : String(e)}`,
+        };
+      }
+      prompt += "\n\nCOMPLETENESS AUDIT — ";
+      if (audit.findings.length > 0) {
+        prompt +=
+          `these lines are in the files this session changed (${audit.source}, ` +
+          `${audit.scannedFiles} file(s) scanned):\n` +
+          audit.text +
+          "\nA deliverable that is a stub, is not wired end to end, or is populated with " +
+          "fake/seed/test data or invented facts is NOT complete — however green the tests " +
+          "are. For every finding above: finish the real implementation, or state the " +
+          "discrepancy plainly to the user in your final message (what is missing, why, what " +
+          "remains). A stub or placeholder is acceptable ONLY when the user asked for exactly " +
+          "that, and then it must be said out loud, never left silent. Never rename a stub " +
+          "into \"v1\", never let placeholder data reach a user-reachable path, and never " +
+          "present an unverified fact as one you checked. Then answer what a scan cannot see: " +
+          "was anything else asked for silently deferred, and is every part reachable from " +
+          "where the user enters it (name the command, request or action that exercised it)? " +
+          "Built-but-never-wired is the stub no marker reveals.";
+      } else if (audit.error) {
+        prompt +=
+          "could not scan the deliverable (" +
+          audit.error +
+          "). Do not imply the deliverable was checked for stubs or fake data. State what " +
+          "you did verify, and confirm no stub, placeholder or invented data is left on a " +
+          "user-reachable path.";
+      } else {
+        prompt +=
+          `no stub, placeholder or fabricated-data markers were found in the ` +
+          `${audit.scannedFiles} changed file(s) scanned (${audit.source}). A clean scan is ` +
+          "NOT proof of a complete deliverable — answer these before you call it done: " +
+          "(1) is every part of what was asked for actually implemented, with nothing silently " +
+          "deferred? (2) is each part reachable from where the user enters it — name the " +
+          "command, request or action you used to exercise it. Built-but-never-wired is the " +
+          "stub a scan cannot see. Anything unfinished or unreachable must be stated plainly " +
+          "to the user, not presented as done.";
       }
     }
 
