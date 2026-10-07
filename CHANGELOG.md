@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-10-05
+
+### Fixed
+
+- **Overflow recovery no longer deadlocks after a successful fallback compaction.**
+  When the host's own context-overflow recovery gave up and pi-vigilant's
+  last-resort compaction succeeded, the agent loop hung instead of resuming the
+  interrupted turn. The `agent_settled` handler queued the resume with
+  `triggerTurn: true` and then blocked on a promise that only a *second*
+  `agent_settled` could resolve — but pi core defers that `triggerTurn` action
+  until every `agent_settled` handler has returned (`_isEmittingAgentSettled`
+  gates `sendCustomMessage`), so the handler waited forever on an event that
+  could not fire until it released. Core already awaits the deferred action to
+  completion before `_emitAgentSettled()` returns to its caller, so the resumed
+  turn was already kept alive without any help from this extension; the extra
+  wait is removed. This is the failure behind a context-overflow 400 repeating
+  with no recovery: once the handler hung, nothing further was processed.
+
+### Tests
+
+- **The test harness now matches the real host's compaction contract.**
+  `ctx.compact()` previously fired `onComplete` directly, skipping the
+  `session_before_compact` and `session_compact` events that pi core emits and
+  awaits before the wrapper's callback runs. That gap is exactly why the
+  deadlock above went unnoticed: the extension's own `session_compact` handler
+  (which disarms the fallback and resets the length budget) never ran in tests.
+  The mock now drives both events in the real order, and `test-length-loop.mjs`
+  drains them between stops so the streak/budget arithmetic matches the host.
+- **New regression check** (`test-context-overflow.mjs` §1b): the
+  `agent_settled` retry handler must release on its own, without a second
+  `agent_settled` being emitted — with a hard timeout, so a recurrence fails
+  fast instead of hanging the suite. Verified to actually catch the bug (fails
+  when the old wait is restored).
+
 ## [0.6.2] - 2026-10-04
 
 ### Added

@@ -35,6 +35,15 @@ export async function loadExtension(extPath, { agentDir } = {}) {
   const tools = new Map();
   const commands = new Map();
   const compacted = [];
+  /**
+   * In-flight ctx.compact() simulations. The real host's AgentSession.compact()
+   * is awaited by its caller; the mock's side effects (session_before_compact /
+   * session_compact emission) run on a detached promise, since ctx.compact()
+   * itself is fire-and-forget and some call sites (Case 1a) never pass an
+   * onComplete to await. Tests that need to observe those side effects before
+   * the next event (e.g. test-length-loop.mjs's loop()) await this array.
+   */
+  const pendingCompacts = [];
   const notifications = [];
   let failNextCompact = false;
 
@@ -89,11 +98,60 @@ export async function loadExtension(extPath, { agentDir } = {}) {
       // Simulate the host completing the compact synchronously (the real host
       // is fire-and-forget; the extension waits on the callbacks). Tests can
       // arm a failure with failNextCompact().
+      //
+      // The real host's AgentSession.compact() (the manual entry point
+      // ctx.compact() wraps) emits "session_before_compact" first — that is
+      // where the extension's own session_before_compact handler increments
+      // compactionFallbackAttempts and supplies the summary — then, on
+      // success, "session_compact" (awaited) BEFORE the ctx.compact()
+      // wrapper's onComplete fires; "session_compact" is what the extension's
+      // session_compact handler uses to disarm compactionFallbackArmed. A
+      // mock that skips either event is not faithful to the host contract and
+      // hides any bug that depends on them having already run (this gap is
+      // why the agent_settled overflow-retry deadlock went unnoticed by this
+      // suite, and why the attempt-cap/budget checks drifted out of sync).
       if (failNextCompact) {
         failNextCompact = false;
-        opts?.onError?.(new Error("compaction failed"));
+        pendingCompacts.push(
+          (async () => {
+            await emit(
+              {
+                type: "session_before_compact",
+                reason: "overflow",
+                willRetry: false,
+                customInstructions: opts?.customInstructions,
+                signal: { aborted: false },
+              },
+              {},
+            );
+            opts?.onError?.(new Error("compaction failed"));
+          })(),
+        );
       } else {
-        opts?.onComplete?.({ tokens: 50000, contextWindow: 168000 });
+        pendingCompacts.push(
+          (async () => {
+            await emit(
+              {
+                type: "session_before_compact",
+                reason: "overflow",
+                willRetry: false,
+                customInstructions: opts?.customInstructions,
+                signal: { aborted: false },
+              },
+              {},
+            );
+            await emit(
+              {
+                type: "session_compact",
+                reason: "overflow",
+                willRetry: false,
+                fromExtension: false,
+              },
+              {},
+            );
+            opts?.onComplete?.({ tokens: 50000, contextWindow: 168000 });
+          })(),
+        );
       }
     },
     ui: {
@@ -121,6 +179,7 @@ export async function loadExtension(extPath, { agentDir } = {}) {
 
   return {
     pi, emit, sent, userMessages, tools, commands, queue, handlers, compacted, notifications,
+    pendingCompacts,
     /** Make the next ctx.compact() fire onError instead of onComplete. */
     failNextCompact() {
       failNextCompact = true;

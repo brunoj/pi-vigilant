@@ -963,12 +963,8 @@ interface ContinuationState {
   compactionFallbackActive: boolean;
   /** Whether the attempt-cap message has already been shown. */
   compactionFallbackExhausted: boolean;
-  /** True while the agent_settled overflow retry is awaiting the resumed run. */
+  /** True while the agent_settled overflow retry's compact is in flight. */
   overflowRetryInFlight: boolean;
-  /** Resolver for the resumed run's agent_settled (overflow retry only). */
-  overflowRetryResume: (() => void) | null;
-  /** True when the overflow retry's continuation was queued (compact succeeded). */
-  overflowRetryQueued: boolean;
   /** Set when the cap/cooldown blocks recovery; cleared by a successful compact. */
   overflowRetryBlocked: boolean;
   /** Number of tool calls in the last agent run (used to detect simple Q&A vs complex task). */
@@ -1190,8 +1186,6 @@ export default function (pi: ExtensionAPI): void {
     compactionFallbackActive: false,
     compactionFallbackExhausted: false,
     overflowRetryInFlight: false,
-    overflowRetryResume: null,
-    overflowRetryQueued: false,
     overflowRetryBlocked: false,
     lastRunToolCallCount: 0,
     taskToolCallCount: 0,
@@ -2387,7 +2381,8 @@ export default function (pi: ExtensionAPI): void {
    * context-pressure compaction budget deliberately survives: that counter is
    * the one that stops a compact → starve → compact loop (§5.5 step 1a). If a
    * successful compaction reset it, every compaction would re-arm its own cap
-   * and the loop would never end.
+   * and the loop would never end. The cooldown likewise survives: it spaces
+   * out compaction attempts regardless of what the last one achieved.
    */
   function noteFreshWindow(): void {
     state.lengthContinuationsQueued = 0;
@@ -3898,10 +3893,27 @@ export default function (pi: ExtensionAPI): void {
     // ctx.compact() cannot run during the run loop — its abort() waits for the
     // session to become idle, which only happens after the loop exits, so it
     // would deadlock. Here the session is idle and not yet disposed, so the
-    // compact can run; the handler blocks until it finishes (onComplete /
-    // onError), so the run cannot end while the compact is in flight. On
-    // success the continuation is queued with triggerTurn: true, which starts
-    // a new run that resumes the interrupted turn.
+    // compact can run; this handler awaits its onComplete/onError callback,
+    // so the run cannot end while the compact is in flight.
+    //
+    // On success the continuation is queued with triggerTurn: true. This
+    // handler runs while the host holds its internal "emitting agent_settled"
+    // flag, so that queue call is NOT started immediately — the host defers it
+    // into its own post-settle action list and runs (and fully awaits) that
+    // list right after every agent_settled handler, including this one,
+    // returns. The host's own _emitAgentSettled() awaits that deferred action
+    // to completion before it returns to ITS caller, so the whole resumed
+    // turn is already kept alive up the call stack without this extension's
+    // help.
+    //
+    // Do NOT add a second wait here for that resumed run to settle (an
+    // earlier version did, via a resolver stashed in `state`). That resumed
+    // run's own agent_settled can only fire after this handler returns — but
+    // a wait here would block this handler from returning until exactly that
+    // event. That is a real deadlock, observed in production: a successful
+    // fallback compaction left the agent loop permanently hung instead of
+    // resuming the interrupted turn, and no further agent_end events for
+    // this turn were ever processed because the handler never released.
     let overflowRetryRan = false;
     if (
       config.compactionFallback &&
@@ -3915,53 +3927,32 @@ export default function (pi: ExtensionAPI): void {
     ) {
       overflowRetryRan = true;
       state.overflowRetryInFlight = true;
-      await new Promise<void>((resolve) => {
-        ctx.compact({
-          customInstructions:
-            "Compaction keeps failing because the span to summarize is too large for one request. " +
-            "Preserve the user's most recent request verbatim and the exact state of the in-flight work " +
-            "so it can be resumed immediately after this summary.",
-          onComplete: () => {
-            // The fallback summary succeeded — resume the interrupted turn.
-            state.overflowRetryQueued = true;
-            queueErrorResumeContinuation();
-            resolve();
-          },
-          onError: () => {
-            // The host emits session_compact_failed again; its handler
-            // (fresh ctx) counts it and stops at the attempt cap. No
-            // continuation was queued, so nothing will resume the run.
-            state.overflowRetryQueued = false;
-            resolve();
-          },
-        });
-      });
-      // The continuation is queued with triggerTurn: true, which starts a new
-      // run that resumes the interrupted turn. pi.sendMessage is fire-and-
-      // forget, so the run would be killed by the print mode's dispose the
-      // moment this handler returns. Block until the resumed run settles:
-      // its agent_settled (below) resolves this promise.
-      if (state.overflowRetryQueued) {
-        // The continuation is queued with triggerTurn: true, which starts a
-        // new run that resumes the interrupted turn. pi.sendMessage is fire-
-        // and-forget, so the run would be killed by the print mode's dispose
-        // the moment this handler returns. Block until the resumed run
-        // settles: its agent_settled (below) resolves this promise.
+      try {
         await new Promise<void>((resolve) => {
-          state.overflowRetryResume = resolve;
+          ctx.compact({
+            customInstructions:
+              "Compaction keeps failing because the span to summarize is too large for one request. " +
+              "Preserve the user's most recent request verbatim and the exact state of the in-flight work " +
+              "so it can be resumed immediately after this summary.",
+            onComplete: () => {
+              // The fallback summary succeeded — resume the interrupted turn.
+              // The host defers and fully awaits this before its own
+              // agent_settled emission returns (see note above) — no extra
+              // wait is needed or safe here.
+              queueErrorResumeContinuation();
+              resolve();
+            },
+            onError: () => {
+              // The host emits session_compact_failed again; its handler
+              // (fresh ctx) counts it and stops at the attempt cap. No
+              // continuation was queued, so nothing will resume the run.
+              resolve();
+            },
+          });
         });
-      } else {
+      } finally {
         state.overflowRetryInFlight = false;
       }
-    }
-
-    // A resumed run settles again: release the overflow retry's waiter and
-    // skip the retry (the compact already ran for this overflow).
-    if (state.overflowRetryResume) {
-      const resume = state.overflowRetryResume;
-      state.overflowRetryResume = null;
-      state.overflowRetryInFlight = false;
-      resume();
     }
 
     if (!config.finalVerification) return;

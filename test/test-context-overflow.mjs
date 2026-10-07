@@ -9,10 +9,14 @@
  * when that recovery fails, and retries the compaction from agent_settled
  * (where the session is idle — a compact from inside the run loop would
  * deadlock on waitForIdle). On success the interrupted turn resumes via a
- * triggerTurn continuation; the handler blocks until the resumed run settles.
+ * triggerTurn continuation; the handler must NOT itself block waiting for
+ * that resumed run to settle (the host defers the continuation until after
+ * every agent_settled handler returns, so such a wait would deadlock — see
+ * settleWithRetry below).
  *
  * Sections:
  *  1  overflow error (provider pattern)      -> no continuation at agent_end
+ *  1b agent_settled retry releases on its own (no deadlock regression)
  *  2  overflow + successful retry compact    -> continuation queued (resume)
  *  3  overflow + failed retry compact        -> notify, no continuation, no hang
  *  4  non-overflow error                     -> continuation (unchanged)
@@ -133,9 +137,16 @@ async function hostOverflowRecovery(emit, ctx) {
 }
 
 /**
- * Drive the agent_settled retry compact. On success the handler blocks until
- * the resumed run settles, so a second agent_settled is emitted to release it
- * (mirrors the real host: the triggerTurn continuation starts a new run).
+ * Drive the agent_settled retry compact and confirm the handler releases on
+ * its own.
+ *
+ * Regression guard: an earlier version of this handler blocked on a promise
+ * that only a SECOND agent_settled could resolve — but that second event can
+ * only fire after the first handler returns (the host defers the triggerTurn
+ * continuation until after every agent_settled handler has finished), so the
+ * handler waited forever and the resumed turn never started. The first emit
+ * below must now complete WITHOUT needing the second one; if it ever hangs
+ * again, the race below fails fast instead of hanging the whole suite.
  */
 async function settleWithRetry(emit, ctx, { failRetry = false, failNextCompact } = {}) {
   if (failRetry) {
@@ -157,11 +168,23 @@ async function settleWithRetry(emit, ctx, { failRetry = false, failNextCompact }
     return;
   }
   const first = emit({ type: "agent_settled" }, ctx);
-  // Yield so the first handler's microtasks (compact onComplete → resume wait)
-  // run before the resumed run's settle is emitted.
-  await new Promise((r) => setImmediate(r));
-  await emit({ type: "agent_settled" }, ctx); // resumed run settles
-  await first;
+  const deadlock = new Promise((_, reject) =>
+    setTimeout(
+      () => reject(new Error("agent_settled handler did not release — deadlock regression")),
+      2000,
+    ),
+  );
+  try {
+    await Promise.race([first, deadlock]);
+  } catch (error) {
+    console.log(`FAIL  agent_settled handler releases on its own — ${error.message}`);
+    results.push({ name: "agent_settled handler releases on its own", cond: false });
+    throw error;
+  }
+  // The host then delivers the triggerTurn continuation; its run settles and
+  // emits agent_settled again. The compact already ran for this overflow, so
+  // the retry must not fire a second time.
+  await emit({ type: "agent_settled" }, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +213,42 @@ section("1 — overflow error: no continuation at agent_end (the core fix)");
   // The host delivers it; the resumed turn succeeds.
   await startRun(emit, queue, llm, ctx);
   check("resumed turn is a fresh run (llm gained the continuation)", llm.some((m) => m.customType === "auto-continue-error"));
+}
+
+// ---------------------------------------------------------------------------
+section("1b — the agent_settled retry releases on its own (deadlock regression)");
+// ---------------------------------------------------------------------------
+{
+  // Regression guard for the deadlock that made overflow recovery hang in
+  // production instead of resuming the turn: the handler used to block on a
+  // promise that only a second agent_settled could resolve, but that event
+  // can only fire after this handler returns (the host defers the triggerTurn
+  // continuation until every agent_settled handler has finished). The emit
+  // below must complete without any second agent_settled being emitted at
+  // all — if it hangs, this fails within the timeout instead of hanging the
+  // whole suite.
+  const { emit, sent, queue, compacted } = await loadExtension(EXT);
+  const llm = [{ role: "user", content: "Fix the auth bug.", timestamp: 1 }];
+  const ctx = { model: { contextWindow: 168000 } };
+  await startRun(emit, queue, llm, ctx);
+  await emit({ type: "agent_end", messages: [overflowError()] }, ctx);
+  await hostOverflowRecovery(emit, ctx);
+
+  const first = emit({ type: "agent_settled" }, ctx);
+  const timedOut = await Promise.race([
+    first.then(() => false),
+    new Promise((resolve) => setTimeout(() => resolve(true), 2000)),
+  ]);
+  check(
+    "agent_settled retry handler releases without needing a second agent_settled",
+    timedOut === false,
+  );
+  check("retry compact ran", compacted.length === 1, `${compacted.length}`);
+  check(
+    "continuation queued for the resumed turn",
+    errorContinuations(sent).length === 1,
+    `${errorContinuations(sent).length}`,
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -97,7 +97,7 @@ async function startRun(emit, queue, llm, ctx = {}) {
 }
 
 /** Run `n` length stops, each in its own run (the production loop shape). */
-async function loop({ emit, queue, llm, sent, n, input, output, window }) {
+async function loop({ emit, queue, llm, sent, pendingCompacts, n, input, output, window }) {
   const ctx = { model: { contextWindow: window } };
   for (let i = 0; i < n; i++) {
     await startRun(emit, queue, llm, ctx);
@@ -105,6 +105,16 @@ async function loop({ emit, queue, llm, sent, n, input, output, window }) {
       { type: "agent_end", messages: [lengthStop({ input, output, window })] },
       ctx,
     );
+    // The real host's AgentSession.compact() (what ctx.compact() wraps) is
+    // awaited by its caller — session_before_compact and session_compact
+    // both finish before the turn's own work continues. The mock's compact()
+    // is fire-and-forget (Case 1a never passes an onComplete to await), so
+    // drain those side effects here to keep the ordering faithful; without
+    // this, noteFreshWindow()'s reset can land one or two stops late and the
+    // streak/budget arithmetic stops matching the real host.
+    if (pendingCompacts?.length) {
+      await Promise.all(pendingCompacts.splice(0, pendingCompacts.length));
+    }
   }
   return sent;
 }
@@ -113,9 +123,9 @@ async function loop({ emit, queue, llm, sent, n, input, output, window }) {
 section("§6.1 — productive length stop (window 50% full) still continues");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue, compacted } = await loadExtension(EXT);
+  const { emit, sent, queue, compacted, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 1, input: 100000, output: 32000, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 1, input: 100000, output: 32000, window: 200000 });
   check("one auto-continue-length queued", lengthContinuations(sent).length === 1, `${lengthContinuations(sent).length}`);
   check("no compaction requested", compacted.length === 0, `${compacted.length}`);
 }
@@ -124,9 +134,9 @@ section("§6.1 — productive length stop (window 50% full) still continues");
 section("§6.2 — starved stop at 99% full compacts instead of continuing");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue, compacted, notifications } = await loadExtension(EXT);
+  const { emit, sent, queue, compacted, notifications, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 1, input: 166660, output: 1, window: 168000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 1, input: 166660, output: 1, window: 168000 });
   check("no auto-continue-length queued", lengthContinuations(sent).length === 0, `${lengthContinuations(sent).length}`);
   check("ctx.compact() called exactly once", compacted.length === 1, `${compacted.length}`);
   check("compaction carries custom instructions", typeof compacted[0]?.customInstructions === "string" && compacted[0].customInstructions.length > 0);
@@ -137,9 +147,9 @@ section("§6.2 — starved stop at 99% full compacts instead of continuing");
 section("§6.3 — the same starved stop repeated 16x compacts exactly once");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue, compacted } = await loadExtension(EXT);
+  const { emit, sent, queue, compacted, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 16, input: 166660, output: 1, window: 168000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 16, input: 166660, output: 1, window: 168000 });
   check("exactly one compaction", compacted.length === 1, `${compacted.length}`);
   check("no continuation loop", lengthContinuations(sent).length === 0, `${lengthContinuations(sent).length}`);
 }
@@ -149,9 +159,9 @@ section("§6.4 — contextPressureCompaction:false falls through to the 1b break
 // ---------------------------------------------------------------------------
 {
   const ext = extWithConfig({ contextPressureCompaction: false });
-  const { emit, sent, queue, compacted, notifications } = await loadExtension(ext);
+  const { emit, sent, queue, compacted, notifications, pendingCompacts } = await loadExtension(ext);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 4, input: 166660, output: 1, window: 168000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 4, input: 166660, output: 1, window: 168000 });
   check("never compacts when disabled", compacted.length === 0, `${compacted.length}`);
   check("breaker pauses after 3", lengthContinuations(sent).length === 3, `${lengthContinuations(sent).length}`);
   check("pause is announced", pauseNotices(notifications).length === 1, `${pauseNotices(notifications).length}`);
@@ -161,9 +171,9 @@ section("§6.4 — contextPressureCompaction:false falls through to the 1b break
 section("§6.5 — 4 productive continuations pause after lengthContinuationMaxConsecutive");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue, compacted, notifications } = await loadExtension(EXT);
+  const { emit, sent, queue, compacted, notifications, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 4, input: 100000, output: 32000, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 4, input: 100000, output: 32000, window: 200000 });
   check("exactly 3 continuations queued", lengthContinuations(sent).length === 3, `${lengthContinuations(sent).length}`);
   check("4th stop is paused with a warning", pauseNotices(notifications).length === 1, `${pauseNotices(notifications).length}`);
   check("productive stops never compact", compacted.length === 0, `${compacted.length}`);
@@ -173,11 +183,11 @@ section("§6.5 — 4 productive continuations pause after lengthContinuationMaxC
 section("§6.6 — 2 starved stops at 50% full: compaction via the streak condition");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue, compacted, notifications } = await loadExtension(EXT);
+  const { emit, sent, queue, compacted, notifications, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
   const window = 200000;
   const input = 100000; // 50% — the ratio condition is NOT met
-  await loop({ emit, queue, llm, sent, n: 3, input, output: 1, window });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 3, input, output: 1, window });
   check("ratio condition was genuinely not met", input < window * 0.9, `${input} < ${window * 0.9}`);
   check("first two stops continue", lengthContinuations(sent).length === 2, `${lengthContinuations(sent).length}`);
   check("third starved stop compacts via the streak", compacted.length === 1, `${compacted.length}`);
@@ -188,24 +198,45 @@ section("§6.6 — 2 starved stops at 50% full: compaction via the streak condit
 section("§6.7 — the streak counters survive agent_start boundaries (§3.1 regression)");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue } = await loadExtension(EXT);
+  const { emit, sent, queue, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
   // Productive stops: the breaker must hold across 10 run boundaries. Before the
   // fix this produced 10 continuations (the production bug); the bound is 3.
-  await loop({ emit, queue, llm, sent, n: 10, input: 100000, output: 32000, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 10, input: 100000, output: 32000, window: 200000 });
   check("10 productive runs across agent_start -> 3 continuations", lengthContinuations(sent).length === 3, `${lengthContinuations(sent).length}`);
   check("bound is independent of run boundaries", lengthContinuations(sent).length < 10);
 }
 {
-  const { emit, sent, queue, compacted } = await loadExtension(EXT);
+  const { emit, sent, queue, compacted, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
   // Starved stops: the surviving starved streak must trigger compaction on the
   // 3rd stop even though the window is only 50% full. A counter reset by
   // agent_start could never reach 3 here.
-  await loop({ emit, queue, llm, sent, n: 10, input: 100000, output: 1, window: 200000 });
+  //
+  // A successful ctx.compact() now drives the real host's session_compact
+  // event (see harness.mjs), which fires noteFreshWindow() and resets the
+  // length budget and starved streak — a genuinely fresh window deserves a
+  // fresh budget (§5.4), so the streak starts over after the first compaction
+  // instead of staying frozen. The compaction itself does not repeat: the
+  // cooldown (CONTEXT_PRESSURE_COMPACTION_COOLDOWN_MS) deliberately survives
+  // noteFreshWindow(), and every stop here happens within milliseconds of
+  // the last, so the second cycle's compaction attempt is blocked. What this
+  // section exists to check — and what still holds — is that the streak
+  // survives the agent_start boundaries between stops (it reaches 3 and
+  // compacts, instead of resetting to 0 every run), and that the fresh-
+  // window reset then lets the length budget restart from 0.
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 10, input: 100000, output: 1, window: 200000 });
   check(
-    "10 starved runs across agent_start -> 2 continuations then compaction",
-    lengthContinuations(sent).length === 2 && compacted.length === 1,
+    "10 starved runs across agent_start -> compaction fires on the 3rd consecutive starved stop",
+    compacted.length === 1,
+    `${lengthContinuations(sent).length} cont / ${compacted.length} compact`,
+  );
+  check(
+    "the fresh-window reset restarts the length budget (cooldown still blocks a 2nd compaction)",
+    // Stops 0-1 continue, stop 2 compacts (streak resets), stops 3-4
+    // continue again (budget reset too), stops 5+ re-enter the compact branch
+    // but the cooldown blocks them — no continuation, no second compaction.
+    lengthContinuations(sent).length === 4 && compacted.length === 1,
     `${lengthContinuations(sent).length} cont / ${compacted.length} compact`,
   );
 }
@@ -214,12 +245,12 @@ section("§6.7 — the streak counters survive agent_start boundaries (§3.1 reg
 section("§6.8 — a user message resets the length budget");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue, notifications } = await loadExtension(EXT);
+  const { emit, sent, queue, notifications, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 3, input: 100000, output: 32000, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 3, input: 100000, output: 32000, window: 200000 });
   check("3 continuations queued before the user message", pauseNotices(notifications).length === 0 && lengthContinuations(sent).length === 3, `${lengthContinuations(sent).length}`);
   await emit({ type: "input", text: "Also update the changelog.", source: "user" });
-  await loop({ emit, queue, llm, sent, n: 1, input: 100000, output: 32000, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 1, input: 100000, output: 32000, window: 200000 });
   check("next length stop continues again after user input", lengthContinuations(sent).length === 4, `${lengthContinuations(sent).length}`);
 }
 
@@ -227,12 +258,12 @@ section("§6.8 — a user message resets the length budget");
 section("§6.9 — session_compact resets the length counters");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue } = await loadExtension(EXT);
+  const { emit, sent, queue, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 3, input: 100000, output: 32000, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 3, input: 100000, output: 32000, window: 200000 });
   check("three continuations queued before compaction", lengthContinuations(sent).length === 3, `${lengthContinuations(sent).length}`);
   await emit({ type: "session_compact", reason: "auto", willRetry: false });
-  await loop({ emit, queue, llm, sent, n: 1, input: 100000, output: 32000, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 1, input: 100000, output: 32000, window: 200000 });
   check("length budget restarts after compaction", lengthContinuations(sent).length === 4, `${lengthContinuations(sent).length}`);
 }
 
@@ -240,10 +271,10 @@ section("§6.9 — session_compact resets the length counters");
 section("§6.10 — isContextOverflow length stops keep the early return (Pi core owns recovery)");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue, compacted } = await loadExtension(EXT);
+  const { emit, sent, queue, compacted, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
   // Overflow.js Case 3: stopReason "length", output 0, input >= 99% of window.
-  await loop({ emit, queue, llm, sent, n: 1, input: 166500, output: 0, window: 168000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 1, input: 166500, output: 0, window: 168000 });
   check("no length continuation for a genuine overflow", lengthContinuations(sent).length === 0, `${lengthContinuations(sent).length}`);
   check("no compaction either (Pi core recovers)", compacted.length === 0, `${compacted.length}`);
 }
@@ -253,9 +284,9 @@ section("§6.11 — maxContextPressureCompactions caps the compaction loop");
 // ---------------------------------------------------------------------------
 {
   const ext = extWithConfig({ maxContextPressureCompactions: 1 });
-  const { emit, sent, queue, compacted, notifications } = await loadExtension(ext);
+  const { emit, sent, queue, compacted, notifications, pendingCompacts } = await loadExtension(ext);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 4, input: 166660, output: 1, window: 168000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 4, input: 166660, output: 1, window: 168000 });
   check("exactly one compaction (the cap)", compacted.length === 1, `${compacted.length}`);
   check("no continuations while context stays exhausted", lengthContinuations(sent).length === 0, `${lengthContinuations(sent).length}`);
   check("operator is told the context is still exhausted", notifications.some((n) => /Context remains exhausted/.test(n.message)));
@@ -265,7 +296,7 @@ section("§6.11 — maxContextPressureCompactions caps the compaction loop");
 section("§6.12 — replay the production 16-starved-stop trace");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue, compacted, notifications } = await loadExtension(EXT);
+  const { emit, sent, queue, compacted, notifications, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
   const { stops, contextWindow } = FIXTURE;
   const ctx = { model: { contextWindow } };
@@ -317,7 +348,7 @@ section("§6.12 — replay the production 16-starved-stop trace");
 section("§6.13 (extra) — a productive stop ends the starvation streak");
 // ---------------------------------------------------------------------------
 {
-  const { emit, sent, queue, compacted } = await loadExtension(EXT);
+  const { emit, sent, queue, compacted, pendingCompacts } = await loadExtension(EXT);
   const llm = [];
   const ctx = { model: { contextWindow: 200000 } };
   // Two starved stops at 50% full build streak=2 ...
@@ -341,9 +372,9 @@ section("§6.14 (extra) — new settings are actually parsed from pi-vigilant.js
 // ---------------------------------------------------------------------------
 {
   const ext = extWithConfig({ lengthContinuationMaxConsecutive: 1 });
-  const { emit, sent, queue, notifications } = await loadExtension(ext);
+  const { emit, sent, queue, notifications, pendingCompacts } = await loadExtension(ext);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 2, input: 100000, output: 32000, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 2, input: 100000, output: 32000, window: 200000 });
   check(
     "lengthContinuationMaxConsecutive:1 -> one continuation then pause",
     lengthContinuations(sent).length === 1 && pauseNotices(notifications).length === 1,
@@ -352,11 +383,11 @@ section("§6.14 (extra) — new settings are actually parsed from pi-vigilant.js
 }
 {
   const ext = extWithConfig({ contextPressureRatio: 0.5 });
-  const { emit, sent, queue, compacted } = await loadExtension(ext);
+  const { emit, sent, queue, compacted, pendingCompacts } = await loadExtension(ext);
   const llm = [];
   // 50% full: with the default ratio this would continue twice, then compact via
   // the streak. With ratio 0.5 the very first stop is already "nearly full".
-  await loop({ emit, queue, llm, sent, n: 1, input: 100000, output: 1, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 1, input: 100000, output: 1, window: 200000 });
   check(
     "contextPressureRatio:0.5 -> first starved stop compacts",
     compacted.length === 1 && lengthContinuations(sent).length === 0,
@@ -365,10 +396,10 @@ section("§6.14 (extra) — new settings are actually parsed from pi-vigilant.js
 }
 {
   const ext = extWithConfig({ lengthContinuationTinyOutputTokens: 100 });
-  const { emit, sent, queue, compacted } = await loadExtension(ext);
+  const { emit, sent, queue, compacted, pendingCompacts } = await loadExtension(ext);
   const llm = [];
   // output=90 is productive at the default 64 threshold but starved at 100.
-  await loop({ emit, queue, llm, sent, n: 1, input: 166660, output: 90, window: 168000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 1, input: 166660, output: 90, window: 168000 });
   check(
     "lengthContinuationTinyOutputTokens:100 -> output 90 counts as starved",
     compacted.length === 1 && lengthContinuations(sent).length === 0,
@@ -379,9 +410,9 @@ section("§6.14 (extra) — new settings are actually parsed from pi-vigilant.js
   // Malformed ratio must fall back to 0.9 — NOT be floored to 0, which would make
   // every window "nearly full" and compact on the first stop at 50%.
   const ext = extWithConfig({ contextPressureRatio: 0 });
-  const { emit, sent, queue, compacted } = await loadExtension(ext);
+  const { emit, sent, queue, compacted, pendingCompacts } = await loadExtension(ext);
   const llm = [];
-  await loop({ emit, queue, llm, sent, n: 1, input: 100000, output: 1, window: 200000 });
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 1, input: 100000, output: 1, window: 200000 });
   check(
     "malformed contextPressureRatio:0 falls back to 0.9 (does not compact at 50%)",
     compacted.length === 0 && lengthContinuations(sent).length === 1,
