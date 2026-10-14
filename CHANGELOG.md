@@ -9,9 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.1] - 2026-10-14
 
-### Added
+### Fixed
 
-- (describe changes for 0.7.1)
+- **`npm run check` now checks.** It was `tsc --noCheck …`, which parses the
+  file and verifies nothing — and `tsc` was not even resolvable in this
+  environment: `node_modules` is a hand-built symlink tree pointing at the
+  global pi install (so the extension resolves the host's own modules), which
+  `npm install` cannot reconcile, so the declared devDependency was never
+  installed. The script reported success while **9 real type errors** sat in
+  `index.ts`. Mutation-checked: a deliberate type error now exits 2, while the
+  old `--noCheck` command exits 0 on the same file.
+  - `scripts/typecheck.sh` resolves the compiler from `node_modules`, then
+    gitignored `.tools/`, then `PATH`, installing `typescript@<devDependency>`
+    into `.tools/` when nothing is found — and prints the version it used, so a
+    gate never silently runs a different compiler than the one declared.
+  - `index.ts`: relative `lib/` imports carry `.js` as NodeNext requires (jiti
+    resolves them; the suite confirms), the seven `registerTool` `execute`
+    signatures now type `onUpdate` with the host's `AgentToolUpdateCallback`
+    (it *is* the callback, not a function taking an update object), and
+    `set_next_tool_timeout` returns the `details` field the host's
+    `AgentToolResult` requires.
+
+### Changed
+
+- **Releases are gated.** `scripts/release.sh` runs the typecheck and the full
+  suite before anything is versioned, tagged or published. Both used to live
+  only in habit, so a release could ship red.
 
 
 ## [0.7.0] - 2026-10-14
