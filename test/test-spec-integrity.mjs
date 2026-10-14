@@ -162,6 +162,19 @@ section("5. get_task_specs surfaces evidence and retirement reasons");
   check("a met spec shows its evidence in the checklist", /evidence:.*toast 'Saved'/s.test(tree));
   check("an obsolete spec says why it was retired", /retired because:.*dropped the export requirement/s.test(tree));
   check("long evidence is clipped, not dumped", !/.{200,}/.test(tree.split("evidence:")[1]?.split("\n")[0] || ""));
+
+  // Pin the deliberate choice: once a spec is retired, the checklist shows why
+  // it was retired rather than the evidence from its earlier verdict — a
+  // retired spec must never read like a met one.
+  const flipped = await newSpec();
+  await call(update, { id: flipped, status: "met", evidence: "browser: exported CSV, opened it, header row correct" });
+  await call(update, { id: flipped, status: "obsolete", reason: "User replaced CSV export with JSONL in review" });
+  const tree2 = textOf(await call(getSpecs, {}));
+  const flippedBlock = tree2.split("\n").slice(
+    tree2.split("\n").findIndex((l) => l.includes(flipped)),
+  ).slice(0, 3).join("\n");
+  check("a met-then-obsolete spec shows the reason, not its old evidence",
+    /retired because:.*JSONL/.test(flippedBlock) && !/evidence:.*CSV/.test(flippedBlock), flippedBlock.replace(/\n/g, " | ").slice(0, 120));
 }
 
 const failed = results.filter((r) => !r.cond);
