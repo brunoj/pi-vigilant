@@ -567,6 +567,8 @@ interface SpecItem {
   sourceQuote?: string;
   supersedes?: string[];
   evidence?: string;
+  /** Why the spec left the gate. Required to mark a spec "obsolete". */
+  reason?: string;
   verifiedAt?: string;
   /** Spec-to-code traceability (M1): how this spec's outcome is delivered and tested. */
   trace?: Trace;
@@ -659,6 +661,12 @@ function specsOverlap(requirement1: string, requirement2: string): boolean {
   return intersection.length >= 0.8 * tokens1.length;
 }
 
+/** Keep the checklist readable: evidence and reasons are one-liners there. */
+function clip(text: string, max = 120): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
 function formatSpecTree(task: SpecTask): string {
   if (Object.keys(task.areas).length === 0) return "";
 
@@ -673,6 +681,15 @@ function formatSpecTree(task: SpecTask): string {
     for (const spec of specs) {
       const status = spec.status === "open" ? "open" : spec.status;
       lines.push(`  [${spec.priority}][${status}]  ${spec.id}: ${spec.requirement}`);
+      // Show what a verdict rests on. A checklist that prints only the status
+      // cannot tell a verified spec from one that was simply marked met, and a
+      // MUST spec that left the gate as "obsolete" should say why in the
+      // listing the agent is reading while it decides what is done.
+      if (spec.status === "obsolete" && spec.reason) {
+        lines.push(`    → retired because: ${clip(spec.reason)}`);
+      } else if (spec.evidence) {
+        lines.push(`    → evidence: ${clip(spec.evidence)}`);
+      }
       if (spec.parentId) {
         lines.push(`    → Sub-spec: ${spec.requirement}`);
       }
@@ -1921,7 +1938,8 @@ export default function (pi: ExtensionAPI): void {
     label: "Update Specification Status",
     description:
       "Mark a specification as met/not-met with concrete evidence. " +
-      "Terminal statuses (met/not-met) require evidence (test output, build result, code inspection). " +
+      "Terminal statuses (met/not-met) are rejected without evidence; 'obsolete' is rejected " +
+      "without a reason naming what supersedes the spec. " +
       "If a spec cannot be objectively verified, use status 'partial' with a note explaining why " +
       "and ask the user — never self-certify unverifiable specs.",
     promptSnippet: "Mark a spec as met/not-met with evidence",
@@ -1933,19 +1951,27 @@ export default function (pi: ExtensionAPI): void {
         description:
           "Status: 'met' (verified and passes), 'not-met' (verified and fails), " +
           "'partial' (unverifiable — needs user confirmation), 'in-progress' (working on it), " +
-          "'obsolete' (superseded by a new requirement).",
+          "'obsolete' (superseded by a new requirement; requires 'reason').",
       }),
       evidence: Type.Optional(
         Type.String({
           description:
             "Concrete evidence for terminal statuses (met/not-met): test output, build result, code inspection. " +
-            "Required for met/not-met. For partial, explain why it's unverifiable.",
+            "Required for met/not-met — the update is rejected if it is missing or blank. " +
+            "Say what you actually checked, not that it is done. For partial, explain why it's unverifiable.",
         }),
       ),
       note: Type.Optional(
         Type.String({
           description:
             "Optional note (e.g., 'needs user confirmation for unverifiable spec')",
+        }),
+      ),
+      reason: Type.Optional(
+        Type.String({
+          description:
+            "Required for status 'obsolete': the requirement that supersedes this spec, or the user " +
+            "decision that retires it. An obsolete with no reason is a silent scope reduction.",
         }),
       ),
       trace: Type.Optional(
@@ -1979,6 +2005,7 @@ export default function (pi: ExtensionAPI): void {
         status: "met" | "not-met" | "partial" | "in-progress" | "obsolete";
         evidence?: string;
         note?: string;
+        reason?: string;
         trace?: Trace;
       },
       _signal: AbortSignal,
@@ -1996,6 +2023,50 @@ export default function (pi: ExtensionAPI): void {
             {
               type: "text" as const,
               text: `Spec '${params.id}' not found. No active task or invalid spec ID.`,
+            },
+          ],
+          isError: true,
+          details: {},
+        };
+      }
+
+      // ── Status integrity ───────────────────────────────────────────────
+      // The settle-time gate keys off these statuses, so leaving "open" has to
+      // cost something. Without this, marking every spec "met" with no evidence
+      // — or "obsolete" with no reason — clears the gate just as cleanly as
+      // real verification does, and nothing downstream can tell them apart.
+      const blank = (v?: string) => !v || v.trim().length === 0;
+      if (
+        (params.status === "met" || params.status === "not-met") &&
+        blank(params.evidence)
+      ) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Spec '${params.id}' not updated: status "${params.status}" requires evidence.\n` +
+                "Name what you actually checked — the command you ran and what it printed, a test " +
+                "or build result, or the file and behaviour you inspected. \"Done\" and \"verified\" " +
+                "are statuses, not evidence.\n" +
+                "If you cannot verify it objectively, use status 'partial' with a note and ask the " +
+                "user; if a new requirement replaces this one, use 'obsolete' with a reason.",
+            },
+          ],
+          isError: true,
+          details: {},
+        };
+      }
+      if (params.status === "obsolete" && blank(params.reason)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Spec '${params.id}' not updated: marking a spec "obsolete" requires a reason.\n` +
+                "Name the requirement that supersedes it, or the user decision that retires it. " +
+                "An unattributed obsolete moves a MUST spec out of the completion gate with no " +
+                "trace of who decided that. If the requirement still stands, leave it open.",
             },
           ],
           isError: true,
@@ -2029,6 +2100,9 @@ export default function (pi: ExtensionAPI): void {
           if (params.evidence) {
             spec.evidence = params.evidence;
           }
+          if (params.reason) {
+            spec.reason = params.reason;
+          }
           if (params.trace) {
             spec.trace = params.trace;
           }
@@ -2060,6 +2134,9 @@ export default function (pi: ExtensionAPI): void {
         `  New status: ${params.status}`,
         `  Evidence: ${params.evidence || "none"}`,
       ];
+      if (params.reason) {
+        resultLines.push(`  Reason: ${params.reason}`);
+      }
       if (params.note) {
         resultLines.push(`  Note: ${params.note}`);
       }

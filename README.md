@@ -85,7 +85,7 @@ Run `/reload` (or restart pi) after installing.
 
 - **Capturing specs:** just state requirements while building. The agent calls `capture_spec` automatically (or you can ask it to).
 - **Viewing specs:** ask the agent to "show the task specs", or the agent calls `get_task_specs` mid-task.
-- **Verification:** happens automatically at task end. The agent marks each spec met/not-met with evidence via `update_spec_status`.
+- **Verification:** happens automatically at task end. The agent marks each spec met/not-met via `update_spec_status` — a terminal status without evidence is rejected, and `obsolete` requires a reason.
 - **Clearing:** `/clear-feedback` and `/clear-specs` are user-only commands (with confirmation).
 - **Feedback:** when you criticize the agent ("you always..."), it should call `capture_feedback`. Checkpoints are injected automatically before the agent declares work complete.
 
@@ -95,7 +95,7 @@ Run `/reload` (or restart pi) after installing.
 |---|---|
 | `capture_spec` | Capture a hard spec (area, priority, parentId, supersedes, dedup guard) |
 | `get_task_specs` | Show the current task's spec tree |
-| `update_spec_status` | Mark specs met/not-met/partial with evidence |
+| `update_spec_status` | Mark specs met/not-met (evidence required), partial, or obsolete (reason required) |
 | `capture_feedback` | Capture behavior criticism (project/global) |
 | `resolve_feedback` | Mark a feedback item resolved |
 | `get_feedback_checkpoints` | Compiled, categorized checkpoints |

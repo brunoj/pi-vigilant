@@ -133,7 +133,8 @@ get_task_specs
 
 ### 3. Update spec status with evidence
 
-For each spec with a terminal status (`met` or `not-met`), provide concrete evidence:
+A terminal status is **rejected without evidence** — the call fails, the spec
+stays open, and the completion gate stays shut:
 
 ```tool
 update_spec_status
@@ -142,7 +143,24 @@ update_spec_status
   evidence: "npm test passes; build log line 12 shows 401 response for unauthenticated requests"
 ```
 
-**CRITICAL:** If a spec cannot be objectively verified, mark it as `partial` with note "needs user confirmation" and **ask the user**. Never self-certify unverifiable specs.
+Name what you actually checked: the command you ran and what it printed, a test
+or build result, the file and behaviour you inspected. "Done" and "verified" are
+statuses, not evidence.
+
+A spec leaving the gate as `obsolete` must **say why** — the requirement that
+supersedes it, or the user decision that retires it:
+
+```tool
+update_spec_status
+  id: "spc-1752-48391"
+  status: "obsolete"
+  reason: "Superseded by spc-1760: the user replaced the CSV export with JSON"
+```
+
+An unattributed obsolete is a silent scope reduction — it moves a MUST spec out
+of the completion gate with no record of who decided that.
+
+**CRITICAL:** If a spec cannot be objectively verified, mark it as `partial` with note "needs user confirmation" and **ask the user**. Never self-certify unverifiable specs. `partial` and `in-progress` deliberately need nothing — the honest way out of a spec must never become a dead end or a reason to ping the user unnecessarily.
 
 ### 4. Clear specs manually
 
@@ -200,7 +218,7 @@ Auto-continue injects specs at two points:
 |------|---------|
 | `capture_spec` | Capture a new hard specification |
 | `get_task_specs` | Retrieve all specs for the current task |
-| `update_spec_status` | Mark a spec as met/not-met with evidence |
+| `update_spec_status` | Mark specs met/not-met (evidence required) or obsolete (reason required) |
 | `/clear-specs` | User-only command to clear all specs |
 
 ## Relationship to Feedback-Memory
