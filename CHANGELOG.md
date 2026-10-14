@@ -9,9 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.2] - 2026-10-14
 
-### Added
+### Fixed
 
-- (describe changes for 0.7.2)
+- **The typecheck now types against the real host API.** The 0.7.1 gate was real
+  but still weak: `node_modules` in this repo resolves
+  `@earendil-works/pi-ai` to a `0.0.0-test` stub with no declarations, so the
+  host API typed as `any` — exactly the class of error that sat here unnoticed
+  for the project's whole life (seven `registerTool` signature mismatches).
+  - `tsconfig.typecheck.json` is committed and maps the pinned peer packages
+    into gitignored `.tools/`, with `strict` on. The check prints both the
+    compiler version and the host-types version it ran.
+  - **devDependencies were stale**: pinned at pi `0.83.0` while the extension
+    runs against pi `1.2.0`. The old pin made the gate *reject working code*
+    — `session_compact_failed` does not exist in 0.83.0. Now pinned to `1.2.0`,
+    and `typebox` to the `1.3.27` the host actually ships.
+  - `ProviderHeaders` is `Record<string, string | null>`, where a null means
+    "do not send this header", and `generateSummaryWithUsage` wants
+    `Record<string, string>`. The two were being passed as if identical; they
+    are now converted by `headerRecord()`, which drops the nulls — the
+    meaning-preserving reading.
 
 
 ## [0.7.1] - 2026-10-14
