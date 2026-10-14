@@ -1,0 +1,32 @@
+{
+  "$comment": [
+    "Used by scripts/typecheck.sh (npm run check). Committed on purpose: the",
+    "paths block is what makes this a real gate. node_modules in these repos is",
+    "a hand-built symlink tree pointing at the global pi install, and",
+    "@earendil-works/pi-ai there is a 0.0.0-test stub with no declarations — so",
+    "a plain tsc run resolved the host API to `any` and checked almost nothing.",
+    "The pinned peer packages are installed into gitignored .tools/ and mapped",
+    "explicitly, so the typecheck runs against the same host API version the",
+    "extension declares, regardless of what the local tree happens to contain."
+  ],
+  "compilerOptions": {
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "types": ["node"],
+    "typeRoots": ["./.tools/node_modules/@types"],
+    "baseUrl": ".",
+    "paths": {
+      "@earendil-works/pi-ai": ["./.tools/node_modules/@earendil-works/pi-ai/dist/index.d.ts"],
+      "@earendil-works/pi-ai/compat": ["./.tools/node_modules/@earendil-works/pi-ai/dist/compat.d.ts"],
+      "@earendil-works/pi-agent-core": ["./.tools/node_modules/@earendil-works/pi-agent-core/dist/index.d.ts"],
+      "@earendil-works/pi-coding-agent": ["./.tools/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"],
+      "typebox": ["./.tools/node_modules/typebox/build/index.d.ts"]
+    }
+  },
+  "include": ["index.ts", "lib/**/*.ts"]
+}

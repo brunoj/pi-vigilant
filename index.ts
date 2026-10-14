@@ -668,6 +668,23 @@ function clip(text: string, max = 120): string {
   return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
 }
 
+/**
+ * The host's `generateSummaryWithUsage` takes plain `Record<string, string>`,
+ * while auth headers arrive as `ProviderHeaders` (`Record<string, string | null>`)
+ * where a null means "do not send this header". Dropping the nulls is the
+ * meaning-preserving conversion; asserting the two types are the same is not.
+ */
+function headerRecord(
+  headers: Record<string, string | null> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value !== null && value !== undefined) out[name] = value;
+  }
+  return out;
+}
+
 function formatSpecTree(task: SpecTask): string {
   if (Object.keys(task.areas).length === 0) return "";
 
@@ -3079,7 +3096,7 @@ export default function (pi: ExtensionAPI): void {
           model,
           reserveTokens,
           auth.apiKey,
-          auth.headers,
+          headerRecord(auth.headers),
           signal,
           customInstructions,
           previous,
@@ -3250,7 +3267,7 @@ export default function (pi: ExtensionAPI): void {
           model,
           reserveTokens,
           auth.apiKey,
-          auth.headers,
+          headerRecord(auth.headers),
           signal,
           TURN_PREFIX_INSTRUCTIONS,
           undefined,
