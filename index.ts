@@ -42,6 +42,7 @@ import type {
   AgentEndEvent,
   SessionCompactEvent,
   SessionBeforeCompactEvent,
+  AgentToolUpdateCallback,
 } from "@earendil-works/pi-coding-agent";
 import {
   buildContextEntries,
@@ -59,8 +60,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { LoopGuardian, type LoopGuardianConfig } from "./lib/loop-guardian";
-import { auditCompleteness, currentRevision, type CompletenessAudit } from "./lib/completeness";
+import { LoopGuardian, type LoopGuardianConfig } from "./lib/loop-guardian.js";
+import { auditCompleteness, currentRevision, type CompletenessAudit } from "./lib/completeness.js";
 
 /**
  * `session_compact_failed` payload. Declared locally because the host's root
@@ -1381,9 +1382,11 @@ export default function (pi: ExtensionAPI): void {
       _toolCallId: string,
       params: { seconds: number },
       _signal: AbortSignal,
-      _onUpdate:
-        | ((update: { content: { type: string; text: string }[] }) => void)
-        | undefined,
+      // The host's own callback type: `onUpdate` IS the callback
+      // ((partialResult: AgentToolResult<T>) => void), not a function taking an
+      // update object. None of these tools stream partial results, so it is
+      // unused — but the signature has to match or the tool is not assignable.
+      _onUpdate: AgentToolUpdateCallback | undefined,
       _ctx: ExtensionContext,
     ) {
       if (
@@ -1398,6 +1401,7 @@ export default function (pi: ExtensionAPI): void {
               text: `Invalid seconds: ${String(params.seconds)}. Must be a positive finite number.`,
             },
           ],
+          details: {},
         };
       }
       const clamped = Math.min(
@@ -1414,6 +1418,7 @@ export default function (pi: ExtensionAPI): void {
               `(one-shot; reverts to the ${config.toolTimeoutCeilingSeconds}s default after it).`,
           },
         ],
+        details: {},
       };
     },
   });
@@ -1485,9 +1490,11 @@ export default function (pi: ExtensionAPI): void {
         user_quote?: string;
       },
       _signal: AbortSignal,
-      _onUpdate:
-        | ((update: { content: { type: string; text: string }[] }) => void)
-        | undefined,
+      // The host's own callback type: `onUpdate` IS the callback
+      // ((partialResult: AgentToolResult<T>) => void), not a function taking an
+      // update object. None of these tools stream partial results, so it is
+      // unused — but the signature has to match or the tool is not assignable.
+      _onUpdate: AgentToolUpdateCallback | undefined,
       _ctx: ExtensionContext,
     ) {
       const timestamp = new Date().toISOString();
@@ -1565,9 +1572,11 @@ export default function (pi: ExtensionAPI): void {
       _toolCallId: string,
       params: { id: string },
       _signal: AbortSignal,
-      _onUpdate:
-        | ((update: { content: { type: string; text: string }[] }) => void)
-        | undefined,
+      // The host's own callback type: `onUpdate` IS the callback
+      // ((partialResult: AgentToolResult<T>) => void), not a function taking an
+      // update object. None of these tools stream partial results, so it is
+      // unused — but the signature has to match or the tool is not assignable.
+      _onUpdate: AgentToolUpdateCallback | undefined,
       _ctx: ExtensionContext,
     ) {
       const timestamp = new Date().toISOString();
@@ -1630,9 +1639,11 @@ export default function (pi: ExtensionAPI): void {
       _toolCallId: string,
       _params: Record<string, unknown>,
       _signal: AbortSignal,
-      _onUpdate:
-        | ((update: { content: { type: string; text: string }[] }) => void)
-        | undefined,
+      // The host's own callback type: `onUpdate` IS the callback
+      // ((partialResult: AgentToolResult<T>) => void), not a function taking an
+      // update object. None of these tools stream partial results, so it is
+      // unused — but the signature has to match or the tool is not assignable.
+      _onUpdate: AgentToolUpdateCallback | undefined,
       _ctx: ExtensionContext,
     ) {
       const checkpoints = getFeedbackCheckpoints();
@@ -1772,9 +1783,11 @@ export default function (pi: ExtensionAPI): void {
         trace?: Trace;
       },
       _signal: AbortSignal,
-      _onUpdate:
-        | ((update: { content: { type: string; text: string }[] }) => void)
-        | undefined,
+      // The host's own callback type: `onUpdate` IS the callback
+      // ((partialResult: AgentToolResult<T>) => void), not a function taking an
+      // update object. None of these tools stream partial results, so it is
+      // unused — but the signature has to match or the tool is not assignable.
+      _onUpdate: AgentToolUpdateCallback | undefined,
       _ctx: ExtensionContext,
     ) {
       const timestamp = new Date().toISOString();
@@ -1904,9 +1917,11 @@ export default function (pi: ExtensionAPI): void {
       _toolCallId: string,
       _params: Record<string, unknown>,
       _signal: AbortSignal,
-      _onUpdate:
-        | ((update: { content: { type: string; text: string }[] }) => void)
-        | undefined,
+      // The host's own callback type: `onUpdate` IS the callback
+      // ((partialResult: AgentToolResult<T>) => void), not a function taking an
+      // update object. None of these tools stream partial results, so it is
+      // unused — but the signature has to match or the tool is not assignable.
+      _onUpdate: AgentToolUpdateCallback | undefined,
       _ctx: ExtensionContext,
     ) {
       const currentFile = getCurrentTaskFile();
@@ -2009,9 +2024,11 @@ export default function (pi: ExtensionAPI): void {
         trace?: Trace;
       },
       _signal: AbortSignal,
-      _onUpdate:
-        | ((update: { content: { type: string; text: string }[] }) => void)
-        | undefined,
+      // The host's own callback type: `onUpdate` IS the callback
+      // ((partialResult: AgentToolResult<T>) => void), not a function taking an
+      // update object. None of these tools stream partial results, so it is
+      // unused — but the signature has to match or the tool is not assignable.
+      _onUpdate: AgentToolUpdateCallback | undefined,
       _ctx: ExtensionContext,
     ) {
       const currentFile = getCurrentTaskFile();

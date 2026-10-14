@@ -21,6 +21,14 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a git repo" >
 git diff --quiet || { echo "working tree dirty — commit or stash first" >&2; exit 1; }
 npm whoami >/dev/null 2>&1 || { echo "not logged in to npm — run 'npm login' first" >&2; exit 1; }
 
+# The gates run before anything is versioned, tagged or published. They used to
+# live only in habit: a release could ship with a type error or a red suite
+# because nothing between "npm run release" and npm publish ever ran them.
+echo "── gate: typecheck ──────────────────────────────────────────"
+npm run --silent check || { echo "release refused: typecheck failed" >&2; exit 1; }
+echo "── gate: test suite ─────────────────────────────────────────"
+npm test || { echo "release refused: test suite failed" >&2; exit 1; }
+
 OLD_VERSION=$(node -p "require('./package.json').version")
 NEW_VERSION=$(npm version "$LEVEL" --no-git-tag-version)
 
