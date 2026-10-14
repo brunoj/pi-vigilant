@@ -11,7 +11,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- (describe changes for 0.7.0)
+- **Spec status integrity.** The completion gate keys off spec status — only
+  `open`/`in-progress` MUST specs block, and only those two keep the
+  verification checklist from being silenced by the cooldown — but
+  `update_spec_status` accepted every transition unconditionally. Two one-call
+  paths therefore cleared the gate as cleanly as real verification: `met` with
+  nothing behind it, and `obsolete` with no stated superseder. Neither path was
+  tested.
+  - `met` / `not-met` are now **rejected** when `evidence` is missing or blank.
+    Presence only: no length or vocabulary heuristics, because those get worked
+    around and make a guard untrustworthy rather than stronger.
+  - `obsolete` is now **rejected** without a `reason` naming the requirement that
+    supersedes it or the user decision that retires it. The reason is stored on
+    the spec.
+  - `get_task_specs` shows what a verdict rests on — evidence for terminal
+    statuses, `retired because:` for obsolete — clipped to one line, so a
+    checklist that prints only a status can no longer pass a verified spec and an
+    unverified one off as the same thing.
+  - `partial` and `in-progress` deliberately require nothing. Making the honest
+    way out of a spec cost an argument would push agents either into a retry
+    loop or into pinging the user about things they need not ask about.
+
+### Tests
+
+- `test/test-spec-integrity.mjs` (29 checks): rejection per status, whitespace
+  and empty-string evidence, a rejection that does not persist (the spec stays
+  `open` — the guard is the handler refusing, not the schema description
+  hoping), evidence persisted on success, obsolete with and without a reason,
+  already-obsolete specs still frozen, `partial`/`in-progress` still free,
+  evidence and reasons surfaced in the checklist. Mutation-checked: with the
+  guard removed, `met` without evidence persists as `met` and `obsolete`
+  persists unattributed.
 
 
 ## [0.6.3] - 2026-10-05
