@@ -62,6 +62,14 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { LoopGuardian, type LoopGuardianConfig } from "./lib/loop-guardian.js";
 import { auditCompleteness, currentRevision, type CompletenessAudit } from "./lib/completeness.js";
+import {
+  loadObligations,
+  applicableObligations,
+  obligationFingerprint,
+  type Obligation,
+  type ObligationLoadResult,
+  type TriggerContext,
+} from "./lib/obligations.js";
 
 /**
  * `session_compact_failed` payload. Declared locally because the host's root
@@ -121,7 +129,7 @@ interface ExtensionConfig {
    * findings in front of the agent, so "done" cannot mean "stubbed".
    */
   completenessGuard: boolean;
-  /** Cap on findings injected per verification (bounded, 06b Rule 15). */
+  /** Cap on findings injected per verification — bounded, so a completion check can never itself become the thing that hangs. */
   completenessMaxFindings: number;
   feedbackMemoryIntegration: boolean;
   specMemoryIntegration: boolean;
@@ -573,6 +581,19 @@ interface SpecItem {
   verifiedAt?: string;
   /** Spec-to-code traceability (M1): how this spec's outcome is delivered and tested. */
   trace?: Trace;
+  /**
+   * Present when this spec came from a**declaration** rather than from
+   * the user. Declared specs are never persisted: they are re-derived from the
+   * declaration files on every read, so a stale copy can never outlive an edit
+   * to the declaration. `class` is the honest enforcement label — `S`
+   * renders as an expectation and must never block.
+   */
+  declared?: {
+    source: string;
+    class?: "H" | "M" | "S";
+    recurring: boolean;
+    fingerprint: string;
+  };
 }
 
 interface SpecTask {
@@ -623,7 +644,12 @@ function loadSpecTask(filePath: string): SpecTask | null {
   try {
     if (!fs.existsSync(filePath)) return null;
     const raw = fs.readFileSync(filePath, "utf-8");
-    return JSON.parse(raw);
+    const task = JSON.parse(raw) as SpecTask;
+    // Declared standing obligations are injected on read and stripped on
+    // write, so they are always current with the declaration files and are
+    // never stored in the task. With no declarations present this returns the
+    // task untouched — the behaviour that predates this module, byte for byte.
+    return withDeclaredObligations(task);
   } catch {
     return null;
   }
@@ -631,7 +657,132 @@ function loadSpecTask(filePath: string): SpecTask | null {
 
 function saveSpecTask(filePath: string, task: SpecTask): void {
   ensureSpecDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(task, null, 2), "utf-8");
+  fs.writeFileSync(filePath, JSON.stringify(stripDeclaredObligations(task), null, 2), "utf-8");
+}
+
+// ─── Declared standing obligations ────────────────────────────────────
+//
+// Vigilant remains a general guard: it never interprets a `source`, never
+// branches on who declared an obligation, and behaves exactly as before when no
+// declarations exist. See lib/obligations.ts for the container and the rule
+// that keeps it general.
+
+/** Session facts the trigger vocabulary can see. Updated by the tool_call hook. */
+const sessionTrigger = { tools: new Set<string>(), paths: new Set<string>() };
+
+let obligationCache: { key: string; result: ObligationLoadResult } | null = null;
+
+function obligationLoadResult(): ObligationLoadResult {
+  const projectDir = process.cwd();
+  const key = `${EXTENSION_DIR}\u0000${projectDir}`;
+  if (obligationCache && obligationCache.key === key) return obligationCache.result;
+  let result: ObligationLoadResult = { obligations: [], errors: [], filesRead: [] };
+  try {
+    result = loadObligations({ extensionDir: EXTENSION_DIR, projectDir, agentDir: getAgentDir() });
+  } catch (e) {
+    // A broken loader must never take the guard down; it reports itself instead.
+    result = { obligations: [], errors: [`obligation load failed: ${(e as Error).message}`], filesRead: [] };
+  }
+  obligationCache = { key, result };
+  return result;
+}
+
+function declaredKey(source: string, id: string): string {
+  return `${source}/${id}`;
+}
+
+/** Archived evidence for a non-recurring obligation, if the same words were already satisfied. */
+function inheritedVerdict(key: string, fingerprint: string): SpecItem | null {
+  try {
+    const archivedDir = path.join(path.dirname(getCurrentTaskFile()), "archived");
+    if (!fs.existsSync(archivedDir)) return null;
+    const names = fs.readdirSync(archivedDir).filter((n) => n.endsWith(".json"));
+    for (const name of names) {
+      let task: SpecTask | null = null;
+      try {
+        task = JSON.parse(fs.readFileSync(path.join(archivedDir, name), "utf-8")) as SpecTask;
+      } catch {
+        continue;
+      }
+      if (!task || !task.areas) continue;
+      for (const specs of Object.values(task.areas)) {
+        for (const s of specs || []) {
+          if (
+            s?.declared &&
+            declaredKey(s.declared.source, s.id.replace(/^declared:/, "")) === key &&
+            s.declared.fingerprint === fingerprint &&
+            s.status === "met" &&
+            s.evidence
+          ) {
+            return s;
+          }
+        }
+      }
+    }
+  } catch {
+    // Archive inspection is best-effort; absence of an inherited verdict is not an error.
+  }
+  return null;
+}
+
+function withDeclaredObligations(task: SpecTask): SpecTask {
+  const loaded = obligationLoadResult();
+  if (loaded.obligations.length === 0) return task;
+
+  const areas = Object.keys(task.areas || {});
+  const specText = Object.values(task.areas || {}).flatMap((specs) => (specs || []).map((s) => s.requirement));
+  const ctx: TriggerContext = {
+    areas,
+    paths: [...sessionTrigger.paths],
+    tools: [...sessionTrigger.tools],
+    specText,
+  };
+
+  const existingIds = new Set(
+    Object.values(task.areas || {}).flatMap((specs) => (specs || []).map((s) => s.id)),
+  );
+
+  for (const ob of applicableObligations(loaded.obligations, ctx)) {
+    const key = declaredKey(ob.source, ob.id);
+    const fingerprint = obligationFingerprint(ob);
+    const id = `declared:${key}`;
+    if (existingIds.has(id)) continue;
+    const recurring = ob.recurring !== false;
+    const inherited = recurring ? null : inheritedVerdict(key, fingerprint);
+    const spec: SpecItem = {
+      id,
+      requirement: ob.requirement,
+      area: ob.area,
+      priority: ob.priority,
+      status: inherited ? "met" : "open",
+      ...(inherited ? { evidence: inherited.evidence, verifiedAt: inherited.verifiedAt } : {}),
+      ...(ob.trace ? { trace: { ...ob.trace } } : {}),
+      declared: { source: ob.source, class: ob.class, recurring, fingerprint },
+    };
+    if (!task.areas) task.areas = {};
+    if (!task.areas[ob.area]) task.areas[ob.area] = [];
+    task.areas[ob.area].push(spec);
+    existingIds.add(id);
+  }
+  return task;
+}
+
+function stripDeclaredObligations(task: SpecTask): SpecTask {
+  if (!task || !task.areas) return task;
+  const hasDeclared = Object.values(task.areas).some((specs) => (specs || []).some((s) => s?.declared));
+  if (!hasDeclared) return task;
+  const areas: Record<string, SpecItem[]> = {};
+  for (const [area, specs] of Object.entries(task.areas)) {
+    const kept = (specs || []).filter((s) => !s?.declared);
+    if (kept.length) areas[area] = kept;
+  }
+  return { ...task, areas };
+}
+
+/** Reported, never swallowed: a declaration that failed to load is visible. */
+function obligationLoadNotes(): string[] {
+  const loaded = obligationLoadResult();
+  return loaded.errors.map((e) => `  ! obligation declaration: ${e}`);
 }
 
 function ensureSpecDir(dir: string): void {
@@ -698,7 +849,13 @@ function formatSpecTree(task: SpecTask): string {
     lines.push(`\n[${area}]`);
     for (const spec of specs) {
       const status = spec.status === "open" ? "open" : spec.status;
-      lines.push(`  [${spec.priority}][${status}]  ${spec.id}: ${spec.requirement}`);
+      // The honest enforcement label, rendered where the reviewer already
+      // looks. `S` is an expectation and must never be read as a blocker; a
+      // checklist that prints only the status cannot tell a verified spec from
+      // one that was simply marked met.
+      const cls = spec.declared?.class ? `[${spec.declared.class}]` : "";
+      const from = spec.declared ? ` (declared by ${spec.declared.source})` : "";
+      lines.push(`  [${spec.priority}][${status}]${cls}  ${spec.id}: ${spec.requirement}${from}`);
       // Show what a verdict rests on. A checklist that prints only the status
       // cannot tell a verified spec from one that was simply marked met, and a
       // MUST spec that left the gate as "obsolete" should say why in the
@@ -726,6 +883,10 @@ function formatSpecTree(task: SpecTask): string {
   lines.push(
     `\nTotal: ${Object.values(task.areas).flat().length} specs, ${openCount} open.`,
   );
+  const notes = obligationLoadNotes();
+  if (notes.length) {
+    lines.push("", "Declared obligations that could not be loaded:", ...notes);
+  }
   lines.push("Verify EACH specification against the actual deliverable.");
   lines.push("Use update_spec_status with concrete evidence for met/not-met.");
   lines.push("=== END SPECIFICATIONS ===");
@@ -1010,8 +1171,8 @@ interface ContinuationState {
   sessionTotalToolCalls: number;
   /**
    * Commit HEAD was at when this session started. Diffing it against HEAD at
-   * completion covers work the agent already committed (the ASF commits per
-   * phase, so the working tree is often clean exactly when it is time to verify).
+   * completion covers work the agent already committed (an agent may commit as
+   * it goes, so the working tree is often clean exactly when it is time to verify).
    */
   completenessBaseline: string | null;
   /** Wall-clock session start, for the non-git mtime fallback. */
@@ -3396,6 +3557,33 @@ export default function (pi: ExtensionAPI): void {
   }
 
   // ── Single agent_end handler covering length + premature stops ───────
+  // ── Declared-obligation triggers ───────────────────────────────────
+  //
+  // `path-glob:` and `tool:` triggers need to know what this run has touched.
+  // This handler only records; it never blocks and never throws — a `tool_call`
+  // handler failure blocks the tool as a fail-safe, so an observer that could
+  // throw would turn a reporting feature into an outage. Every path is wrapped.
+  pi.on(
+    "tool_call",
+    (event: { toolName?: string; input?: Record<string, unknown> }) => {
+      try {
+        if (typeof event?.toolName === "string" && event.toolName) {
+          sessionTrigger.tools.add(event.toolName);
+        }
+        const input = event?.input;
+        if (input && typeof input === "object") {
+          for (const key of ["path", "file", "filePath", "file_path", "command"]) {
+            const v = (input as Record<string, unknown>)[key];
+            if (typeof v === "string" && v) sessionTrigger.paths.add(v);
+          }
+        }
+      } catch {
+        // Observing must never break the thing it observes.
+      }
+      return undefined;
+    },
+  );
+
   pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
     const assistant = lastAssistantMessage(event.messages);
 

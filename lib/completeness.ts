@@ -19,7 +19,7 @@
  * correct practice, and flagging it would train everyone to ignore the guard.
  *
  * Pure functions, no dependencies, safe to call on every completion: git calls
- * are bounded (06b Rule 15) and the file set is capped.
+ * are bounded and the file set is capped.
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -175,7 +175,7 @@ function git(root: string, args: string[]): string | null {
   try {
     return execFileSync("git", ["-C", root, ...args], {
       encoding: "utf8",
-      timeout: 5000, // 06b Rule 15: nothing in a completion path may hang
+      timeout: 5000, // nothing in a completion path may hang
       maxBuffer: 4 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"],
     });

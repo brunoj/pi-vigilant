@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`lib/obligations.ts` — obligation loading with source attribution.** A
+  consumer (an ASF-style skill, a project's own rules) can now declare
+  obligations for the loop guard to verify at settle, and the guard treats them
+  exactly like specifications from any other source.
+  - Declarations are discovered in four places: an extension's own
+    `obligations.d/*.json`, an agent-wide drop-in `<agentDir>/obligations.d/`,
+    sibling extensions under `<agentDir>/extensions/*/obligations.d/`, and a
+    project's `.vigilant/obligations.json`.
+  - `LoadedObligation` makes `source` **required after loading**, filled from
+    the declaring file, with `declarationLocations` recorded so a reader can see
+    where a rule came from.
+  - **The guard stays general.** `source` is carried verbatim and never
+    interpreted — the container does not branch on it, and no consumer
+    vocabulary appears anywhere in the guard. The guard checks *completion*; it
+    does not need to know what a cascade or a gate is, and must not have to.
+- **`test/test-obligations.mjs` — 60 checks** covering loading, attribution,
+  applicability, integration with the spec tree, sibling-extension and drop-in
+  discovery, and the rule that an obligation nobody declared is not silently
+  treated as satisfied.
+
 ## [0.7.2] - 2026-10-14
 
 ### Fixed
