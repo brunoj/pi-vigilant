@@ -76,12 +76,18 @@ for (const rel of packed) {
     const spec = m[2];
     const relTarget = relative(REPO, rresolve(dirname(abs), spec)).replace(/\\/g, "/");
     followed.push(`${rel} -> ${spec}`);
+    // pi loads .ts directly (jiti) and this package imports its own modules with a
+    // `.js` specifier; a .d.mts declaration file also names its sibling as
+    // `./x.d.mjs` (the ESM declaration convention), which is not a missing file.
+    const base = relTarget.replace(/\.d\.mjs$/, ".d.mts").replace(/\.mjs$/, ".mts").replace(/\.js$/, ".ts");
     const candidates = [
       relTarget,
-      relTarget.replace(/\.js$/, ".ts"),
-      relTarget.replace(/\.ts$/, ""),
-      `${relTarget}.ts`,
-      join(relTarget, "index.ts").replace(/\\/g, "/"),
+      base,
+      base.replace(/\.ts$/, ""),
+      base.replace(/\.mts$/, ""),
+      `${base}.ts`,
+      `${base}.mts`,
+      join(dirname(relTarget), "index.ts").replace(/\\/g, "/"),
     ];
     if (!candidates.some((c) => shipped.has(c))) missing.push(`${rel}: ${spec}`);
   }
