@@ -58,6 +58,46 @@ git push --follow-tags
 git push origin "$NEW_VERSION"
 npm publish
 
+# Gate: the publish actually landed. `npm publish` exits 0 when npm ACCEPTS the
+# upload, but npm can hold a version in its staging queue (security review) and
+# never make it public — and then re-publishing the same version fails with
+# `409 Cannot publish over previously staged version`. This script used to print
+# "✅ Released" on the strength of the exit code alone, so a release that never
+# reached anyone looked exactly like one that did. Poll the registry for the
+# version itself; a tag and a commit are not a release.
+echo "── gate: publish landed ─────────────────────────────────────────"
+PKG_NAME=$(node -p "require('./package.json').name")
+node - "$PKG_NAME" "${NEW_VERSION#v}" <<'EOF' || exit 1
+const [name, version] = process.argv.slice(2);
+const url = `https://registry.npmjs.org/${encodeURIComponent(name)}?t=${Date.now()}`;
+const has = async () => {
+  const res = await fetch(url, { headers: { "Cache-Control": "no-cache" } });
+  if (!res.ok) return false;
+  const doc = await res.json();
+  return !!doc.versions?.[version] && doc["dist-tags"]?.latest === version;
+};
+const DEADLINE = Date.now() + 180_000;
+(async () => {
+  let attempt = 0;
+  while (Date.now() < DEADLINE) {
+    attempt++;
+    if (await has()) {
+      console.log(`published: ${name}@${version} is live on the registry`);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 5_000));
+  }
+  console.error(
+    `release INCOMPLETE: ${name}@${version} is not on the registry after 3 minutes.\n` +
+      `npm most likely holds it in its staging queue (security review), or rejected it.\n` +
+      `The git tag exists but nobody can install this version — check\n` +
+      `https://www.npmjs.com/package/${name} and the security-holds page, then\n` +
+      `re-publish (a still-staged version cannot be re-published: it 409s).`,
+  );
+  process.exit(1);
+})();
+EOF
+
 echo ""
 echo "✅ Released $OLD_VERSION → $NEW_VERSION"
 echo "   Tag:   $NEW_VERSION"
