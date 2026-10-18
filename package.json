@@ -27,10 +27,11 @@
   ],
   "scripts": {
     "clean": "echo 'nothing to clean'",
-    "build": "echo 'nothing to build — pi loads .ts via jiti at runtime'",
+    "build": "echo 'nothing to build \u2014 pi loads .ts via jiti at runtime'",
     "check": "./scripts/typecheck.sh",
     "test": "./test/run-all.sh",
-    "release": "./scripts/release.sh"
+    "release": "./scripts/release.sh",
+    "test:e2e": "./test/run-e2e.sh"
   },
   "pi": {
     "extensions": [

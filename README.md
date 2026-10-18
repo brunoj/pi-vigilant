@@ -108,10 +108,31 @@ Run `/reload` (or restart pi) after installing.
 ```bash
 npm install        # devDependencies for type-checking
 npm run check      # tsc --noEmit
+npm test           # full in-process suite (14 files, real index.ts)
+npm run test:e2e   # live end-to-end against the real pi host (needs `pi` on PATH)
 npm run release    # bump version + changelog + tag + publish (see below)
 ```
 
-Test suites used during development live in the repo history (see the 0.1.0-era commits for the 11-scenario test matrix and design notes).
+### Live end-to-end proof
+
+`npm test` drives the real extension in-process with a mocked host. That cannot
+prove two things, so `test/run-e2e.sh` runs them against the actual `pi` CLI
+against a capturing OpenAI-compatible proxy (`test/e2e/proxy.mjs`) that journals
+every request body — so the assertions are about what the model was actually
+shown, not about what the extension claims it did:
+
+| scenario | what it proves |
+| --- | --- |
+| `loop-positive` | a forced identical-tool-call loop makes the guardian inject a real user-role steer that **appears in the provider request**, escalates to level 2, and the turn then completes |
+| `loop-negative` | real work (varied calls) is never steered |
+| `compaction` | the host's own summarization is rejected twice, the fallback arms, its bounded slices succeed, and the host **accepts the returned CompactionEntry** (`session_compact` with `fromExtension: true`) |
+| `resume` | a compaction that lands mid-run does not dead-end the session — the next agent turn goes out carrying the summary |
+
+`test/e2e/spy.ts` records what the host emits around compaction; `test/e2e/make-session.mjs`
+seeds a session with finalized turns (without it the host hands the fallback an
+empty span and the scenario proves nothing). Negative controls are documented at
+the top of `test/run-e2e.sh`: switching `loopGuardian` or `compactionFallback`
+off makes the corresponding scenario fail.
 
 ### Releasing (auto-versioning)
 
