@@ -76,7 +76,7 @@ const has = async () => {
   const doc = await res.json();
   return !!doc.versions?.[version] && doc["dist-tags"]?.latest === version;
 };
-const DEADLINE = Date.now() + 180_000;
+const DEADLINE = Date.now() + 480_000;
 (async () => {
   let attempt = 0;
   while (Date.now() < DEADLINE) {
