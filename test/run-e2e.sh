@@ -52,7 +52,7 @@ if [ -n "${E2E_GUARD_CONFIG:-}" ]; then GUARD_ON="$E2E_GUARD_CONFIG"; else
 GUARD_ON='{"loopGuardian":true,"loopCooldownMs":0,"prematureStopDetection":false,"lengthStopContinuation":false,"compactionContinuation":false,"finalVerification":false,"completenessGuard":false}'
 fi
 if [ -n "${E2E_COMPACT_CONFIG:-}" ]; then COMPACT_CFG="$E2E_COMPACT_CONFIG"; else
-COMPACT_CFG='{"loopGuardian":false,"prematureStopDetection":false,"lengthStopContinuation":false,"compactionContinuation":true,"finalVerification":false,"completenessGuard":false,"compactionFallback":true,"compactionFallbackAfterFailures":2,"maxCompactionFallbackAttempts":5,"compactionFallbackChunkTokens":800,"maxCompactionFallbackChunks":12}'
+COMPACT_CFG='{"loopGuardian":false,"prematureStopDetection":false,"lengthStopContinuation":false,"compactionContinuation":true,"finalVerification":false,"completenessGuard":false,"compactionFallback":true,"compactionFallbackAfterFailures":2,"maxCompactionFallbackAttempts":5,"compactionFallbackChunkTokens":800,"maxCompactionFallbackChunks":40}'
 fi
 
 # The extension is copied per run: its config is read from its own directory, so
@@ -119,6 +119,19 @@ EOF
 }
 
 journal() { grep -c "$1" "$E2E_LOG" 2>/dev/null || true; }
+# The CompactionEntry we hand back is written into the session by the host, and it
+# carries our `details` — so the mechanism that actually produced the compaction is
+# readable from the artifact, not inferred from request shapes.
+mech() { python3 -c "
+import json
+for l in open('$RUN/sessions/s.jsonl'):
+    d=json.loads(l)
+    if d.get('type')!='compaction': continue
+    det=d.get('details') or {}
+    if det.get('source')=='pi-vigilant-compaction-fallback':
+        print(det.get('mechanism'),det.get('chunks'),det.get('partial'))
+        break
+" 2>/dev/null; }
 
 STAGE="$(mktemp -d /tmp/pv-e2e-ext.XXXXXX)"
 
@@ -145,7 +158,10 @@ case "${1:-all}" in
     # The knobs are set so the mechanism is actually exercised rather than
     # accidentally bypassed: with the default 8192-token chunk the whole span fits
     # in one slice, so a slice is exactly as big as the request that just failed.
-    # Smaller slices + a lower arming threshold make the bounded-fold path real.
+    # Smaller slices make the bounded-fold path real. The chunk budget must also be
+    # wide enough for the fold to COVER the span (~28 slices at 800 tokens for this
+    # span) — with the earlier 12-chunk budget the fold always bound and the adopted
+    # entry was prefix-cut, which is the other scenario's assertion, not this one's.
     stage_ext "$STAGE/compact" "$COMPACT_CFG"
     EXT="$STAGE/compact/index.ts"
     export E2E_FAIL_ABOVE="${E2E_FAIL_ABOVE:-20000}" E2E_MAX_REQUESTS=90 E2E_CTX=20000
@@ -175,6 +191,7 @@ ls=[json.loads(l) for l in open('$E2E_LOG')]
 print(sum(1 for d in ls if d['summary'] and d['bytes']<=int('$E2E_FAIL_ABOVE')))" 2>/dev/null || echo 0)
     [ "$rejected" -ge 2 ] && ok "the host's compaction failed at least twice (rejected summaries: $rejected)" || bad "compaction did not fail twice (rejected: $rejected)"
     [ "$accepted" -ge 1 ] && ok "the fallback's bounded summaries were accepted (accepted: $accepted)" || bad "no bounded summary request ever succeeded"
+    m=$(mech); [ "${m%% *}" = "chunked-fold" ] && ok "the mechanism that produced it was the chunked fold ($m)" || bad "expected mechanism chunked-fold, got '${m:-none}'"
     grep -q '"kind":"session_compact"' "$RUN/spy.jsonl" 2>/dev/null && ok "session_compact fired" || bad "session_compact never fired"
     grep -q '"fromExtension":true' "$RUN/spy.jsonl" 2>/dev/null && ok "the host accepted the fallback's compaction (fromExtension=true)" || bad "the host never accepted the fallback's compaction"
     # The summary must reach an AGENT turn. Matching E2E_SUMMARY anywhere is a
@@ -212,6 +229,42 @@ ls=[json.loads(l) for l in open('$E2E_LOG')]
 last=max([i for i,d in enumerate(ls,1) if d['summary']]+[0])
 print(sum(1 for i,d in enumerate(ls,1) if i>last and not d['summary'] and 'E2E_SUMMARY' in json.dumps(d.get('tail') or [])))" 2>/dev/null || echo 0)
     [ "$resumed" -ge 1 ] && ok "the turn resumed after the compaction, carrying the summary" || bad "no agent turn went out after the compaction"
+    [ "$(journal 'could not summarize the context')" -eq 0 ] && ok "the dead-end message never appeared" || bad "the session hit the dead-end message"
+    ;;
+esac
+
+case "${1:-all}" in
+  all|prefix-cut)
+    # The spec's second half: "repeat with a threshold low enough that only
+    # Mechanism B can complete". Mechanism B is the halved-span cut, and it is what
+    # runs when the fold cannot complete within maxCompactionFallbackChunks. Capping
+    # that budget is the knob that makes it bind; the observable signature is a
+    # compaction adopted after only `chunks` bounded slice requests — a partial
+    # summary that still shrinks the context, so the round always makes progress.
+    stage_ext "$STAGE/prefixcut" '{"loopGuardian":false,"prematureStopDetection":false,"lengthStopContinuation":false,"compactionContinuation":true,"finalVerification":false,"completenessGuard":false,"compactionFallback":true,"compactionFallbackAfterFailures":2,"maxCompactionFallbackAttempts":5,"compactionFallbackChunkTokens":800,"maxCompactionFallbackChunks":2}'
+    EXT="$STAGE/prefixcut/index.ts"
+    export E2E_FAIL_ABOVE="${E2E_FAIL_ABOVE:-20000}" E2E_MAX_REQUESTS=90 E2E_CTX=20000
+    export E2E_SESSION_TURNS=24 E2E_SESSION_SIZE=1500 E2E_WORK_TURNS=40
+    export E2E_CONTEXT_WINDOW=20000 E2E_MAX_TOKENS=512
+    export E2E_SETTINGS='{"compaction":{"enabled":true,"reserveTokens":16384,"keepRecentTokens":2000}}'
+    export E2E_USE_SPY=1
+    run_scenario "prefix-cut" overflow "read log.txt over and over until you have the whole picture"
+    rejected=$(python3 -c "
+import json
+ls=[json.loads(l) for l in open('$E2E_LOG')]
+print(sum(1 for d in ls if d['summary'] and d['bytes']>int('$E2E_FAIL_ABOVE')))" 2>/dev/null || echo 0)
+    accepted=$(python3 -c "
+import json
+ls=[json.loads(l) for l in open('$E2E_LOG')]
+print(sum(1 for d in ls if d['summary'] and d['bytes']<=int('$E2E_FAIL_ABOVE')))" 2>/dev/null || echo 0)
+    [ "$rejected" -ge 2 ] && ok "the host's compaction failed at least twice (rejected: $rejected)" || bad "compaction did not fail twice (rejected: $rejected)"
+    # The whole span needs far more slices than the budget allows, so the fold
+    # cannot complete and the halved-span cut is what produces the compaction — read
+    # from the CompactionEntry's own details rather than guessed at from slice counts
+    # (an earlier version guessed from them and was wrong: the chunk budget is per
+    # attempt, so 7 slices across 5 attempts was still a bound fold).
+    m=$(mech); [ "${m%% *}" = "prefix-cut" ] && ok "only Mechanism B could complete, and it did ($m)" || bad "expected mechanism prefix-cut when the fold budget binds, got '${m:-none}'"
+    grep -q '"fromExtension":true' "$RUN/spy.jsonl" 2>/dev/null && ok "a partial compaction was still returned and adopted — the round made progress" || bad "no compaction adopted when the fold could not complete"
     [ "$(journal 'could not summarize the context')" -eq 0 ] && ok "the dead-end message never appeared" || bad "the session hit the dead-end message"
     ;;
 esac
