@@ -125,14 +125,36 @@ shown, not about what the extension claims it did:
 | --- | --- |
 | `loop-positive` | a forced identical-tool-call loop makes the guardian inject a real user-role steer that **appears in the provider request**, escalates to level 2, and the turn then completes |
 | `loop-negative` | real work (varied calls) is never steered |
-| `compaction` | the host's own summarization is rejected twice, the fallback arms, its bounded slices succeed, and the host **accepts the returned CompactionEntry** (`session_compact` with `fromExtension: true`) |
+| `compaction` | the host's own summarization is rejected twice, the fallback arms, its bounded slices succeed, and the host **accepts the returned CompactionEntry** (`session_compact` with `fromExtension: true`); `test/e2e/fit-check.mjs` then reads that entry off the session file and asserts one summary (no stacking), a strict shrink, and a conservative estimate inside the 1.75–3× band |
 | `resume` | a compaction that lands mid-run does not dead-end the session — the next agent turn goes out carrying the summary |
+| `prefix-cut` | with the bounded summaries pushed past the cap so only the drop-only path can finish, **Mechanism B** still returns a compaction the host adopts — the round makes progress and the `could not summarize the context` dead-end never appears |
+| `tool-timeout` | a 12 s hanging tool call is cut by the ceiling (the run takes ~5 s, not 12), the model is told the call was aborted, and the session carries on |
+| `ttl` | `set_next_tool_timeout` is **one-shot**: the TTL'd call runs past the ceiling, and the very next call is cut by it again (18 s for a 12 s call + a 3 s cut) |
 
 `test/e2e/spy.ts` records what the host emits around compaction; `test/e2e/make-session.mjs`
 seeds a session with finalized turns (without it the host hands the fallback an
 empty span and the scenario proves nothing). Negative controls are documented at
 the top of `test/run-e2e.sh`: switching `loopGuardian` or `compactionFallback`
 off makes the corresponding scenario fail.
+
+Recursive slice halving is **unit-proven only** (`test/test-compaction-fallback.mjs`);
+no live scenario drives it reliably, and none is claimed here.
+
+### The artifact gate
+
+`test/test-packaging.mjs` checks the **packed** file set rather than the working
+tree: `index.ts` and every `lib/` module ship, `pi.extensions`/`pi.skills` point at
+files that are actually in the tarball, and no relative import inside the artifact
+points outside it. A `files` allowlist that has to be updated by hand fails
+silently — typecheck reads the working tree, the suite runs from the working tree,
+and `npm publish` only reports that the upload was accepted. At the time this gate
+was added, dropping `lib/` from `files` took it from 16/16 to 11/16 and named all
+three missing modules.
+
+`npm run release` finishes by running `scripts/verify-published.mjs`, which installs
+the just-published version **from the registry** into a throwaway prefix and imports
+the installed extension, requiring its default export to be the activate function.
+`BMX_SKIP_PUBLISHED_VERIFY=1` skips it.
 
 ### Releasing (auto-versioning)
 

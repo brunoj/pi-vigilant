@@ -98,6 +98,18 @@ const DEADLINE = Date.now() + 180_000;
 })();
 EOF
 
+# Gate: the PUBLISHED artifact. Every gate above reads the working tree, which is
+# how a package can ship a tarball missing a module its own entry point imports
+# with a green suite (pi-aia-browser 0.2.1). This installs the version from the
+# registry into a throwaway prefix and imports the installed extension.
+if [ "${BMX_SKIP_PUBLISHED_VERIFY:-}" != "1" ]; then
+  echo "── gate: published artifact verified ─────────────────────"
+  node scripts/verify-published.mjs "${NEW_VERSION#v}" || {
+    echo "release INCOMPLETE: ${NEW_VERSION} is on the registry but the installed artifact does not load" >&2
+    exit 1
+  }
+fi
+
 echo ""
 echo "✅ Released $OLD_VERSION → $NEW_VERSION"
 echo "   Tag:   $NEW_VERSION"

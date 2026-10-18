@@ -4,6 +4,43 @@ All notable changes to pi-vigilant are documented here.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-18
+
+### Added
+
+- **`test/test-packaging.mjs` — the artifact gate.** It checks the **packed** file set,
+  not the working tree: `index.ts` and every `lib/` module ship, `pi.extensions` and
+  `pi.skills` point at entries that are actually in the tarball, and no relative
+  import inside the artifact points outside it. Until now nothing could see a broken
+  `files` allowlist — typecheck reads source files, the suite imports `index.ts` from
+  disk, and `npm publish` only reports that the upload was accepted. Negative control:
+  dropping `lib/` from `files` takes the gate from 16/16 to 11/16 and names all three
+  modules `index.ts` imports.
+- **`scripts/verify-published.mjs` — post-publish verification of the published bytes.**
+  `npm run release` now ends by installing the just-published version **from the
+  registry** into a throwaway prefix and importing the installed extension, requiring
+  its default export to be the activate function pi calls. `npm publish` exiting 0
+  only means npm accepted the upload, and the packument can list a version whose
+  tarball is not installable yet. Set `BMX_SKIP_PUBLISHED_VERIFY=1` to skip the gate.
+
+### Fixed
+
+- **README documented 4 of the 7 live E2E scenarios.** `prefix-cut`, `tool-timeout`
+  and `ttl` had been run for releases without ever being written down, so the table
+  understated what the suite proves. It now covers all seven, including what each one
+  actually asserts, and states plainly that recursive slice halving is unit-proven
+  only — no live scenario drives it, and none is claimed.
+
+### Tests
+
+- The live E2E harness is now committed and self-contained (`test/run-e2e.sh`,
+  `test/e2e/proxy.mjs`, `test/e2e/fit-check.mjs`, `test/e2e/spy.ts`,
+  `test/e2e/make-session.mjs`) and reachable via `npm run test:e2e`: 7 scenarios,
+  30 checks against the real `pi` CLI and a capturing provider proxy, so the
+  assertions are about what the model was actually shown. A full run no longer leaks
+  a proxy per scenario — the previous scenario's recorded PID is reaped after
+  `/proc/<pid>/stat` confirms it is ours.
+
 ## [0.8.0] - 2026-10-18
 
 ### Added
