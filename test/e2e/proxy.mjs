@@ -186,13 +186,25 @@ const server = createServer((req, res) => {
         return;
       }
       if (FAIL_ABOVE > 0 && entry.bytes > FAIL_ABOVE && entry.summary) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          error: {
-            message: `This model's maximum context length is 168000 tokens. However, you requested 1 output tokens and your prompt contains at least ${entry.bytes} input tokens.`,
-            type: "BadRequestError", param: "input_tokens", code: 400,
-          },
-        }));
+        // Two distinct production signatures, and the difference matters:
+        //  - the whole-span request gets a hard 400 (what the host's own compaction
+        //    hits, and what arms the fallback);
+        //  - a slice that is too big gets a SUCCESSFUL response truncated at the
+        //    output cap (stopReason "length"). That is the signature the fallback
+        //    splits on; a 400 here reads as a provider error and goes to the
+        //    prefix-cut path instead, so the split code never runs.
+        if (entry.bytes > Number(process.env.E2E_FAIL_HARD || 20000)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: {
+              message: `Summarization failed: generation hit the token cap and the summary is incomplete. (prompt contained at least ${entry.bytes} input tokens)`,
+              type: "BadRequestError", param: "input_tokens", code: 400,
+            },
+          }));
+          return;
+        }
+        sse(res, [{ role: "assistant" }, { content: summaryText(`truncated ${turns}`).slice(0, 200) }], "length",
+          usageFor(entry.bytes));
         return;
       }
       if (entry.summary) {
