@@ -77,10 +77,15 @@ run_scenario() {
   export E2E_LOG="$RUN/requests.jsonl"
   export E2E_PORT_FILE="$RUN/port"
   export E2E_MAX_REQUESTS="${E2E_MAX_REQUESTS:-60}"
+  # A previous scenario's proxy is ours to reap: the EXIT trap below can only ever
+  # hold ONE pid, so without this a full run leaked one process per scenario (49
+  # accumulated before it was noticed). Kill by the exact PID we recorded — never a
+  # pattern kill, which would also match the wrapper shell running this script.
+  if [ -n "${PROXY_PID:-}" ]; then kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true; fi
   node "$HERE/e2e/proxy.mjs" > "$RUN/proxy.out" 2>&1 &
   PROXY_PID=$!
   # Record the PID we started and kill exactly that — never a pattern kill.
-  trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
+  trap 'kill "${PROXY_PID:-}" 2>/dev/null || true' EXIT
 
   local port=""
   for _ in $(seq 1 50); do
