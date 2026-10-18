@@ -282,6 +282,13 @@ section("§6.10 — isContextOverflow length stops keep the early return (Pi cor
 // ---------------------------------------------------------------------------
 section("§6.11 — maxContextPressureCompactions caps the compaction loop");
 // ---------------------------------------------------------------------------
+// Two configurations, because the cap means two different things depending on
+// whether the last-resort fallback exists. With the fallback OFF the cap is the
+// end of the line and the operator must be told to start a new session. With it
+// ON the cap bounds only pi-vigilant's own recovery: latching the block here is
+// what dead-locked a production session (the starved-length stop reached the
+// cap, overflowRetryBlocked went true, and agent_settled could never retry the
+// compaction — the same two give-up messages every turn, forever).
 {
   const ext = extWithConfig({ maxContextPressureCompactions: 1 });
   const { emit, sent, queue, compacted, notifications, pendingCompacts } = await loadExtension(ext);
@@ -289,7 +296,22 @@ section("§6.11 — maxContextPressureCompactions caps the compaction loop");
   await loop({ emit, queue, llm, sent, pendingCompacts, n: 4, input: 166660, output: 1, window: 168000 });
   check("exactly one compaction (the cap)", compacted.length === 1, `${compacted.length}`);
   check("no continuations while context stays exhausted", lengthContinuations(sent).length === 0, `${lengthContinuations(sent).length}`);
-  check("operator is told the context is still exhausted", notifications.some((n) => /Context remains exhausted/.test(n.message)));
+  check(
+    "the give-up message is NOT shown while the fallback can still run",
+    !notifications.some((n) => /Context remains exhausted/.test(n.message)),
+    notifications.filter((n) => /Context remains exhausted/.test(n.message)).length ? "shown" : "suppressed",
+  );
+}
+{
+  const ext = extWithConfig({ maxContextPressureCompactions: 1, compactionFallback: false });
+  const { emit, sent, queue, compacted, notifications, pendingCompacts } = await loadExtension(ext);
+  const llm = [];
+  await loop({ emit, queue, llm, sent, pendingCompacts, n: 4, input: 166660, output: 1, window: 168000 });
+  check("cap still holds with the fallback disabled", compacted.length === 1, `${compacted.length}`);
+  check(
+    "with no fallback, the operator IS told the context is still exhausted",
+    notifications.some((n) => /Context remains exhausted/.test(n.message)),
+  );
 }
 
 // ---------------------------------------------------------------------------

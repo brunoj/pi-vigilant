@@ -3683,16 +3683,26 @@ export default function (pi: ExtensionAPI): void {
         state.starvedLengthStreak++;
         state.lastResponseConclusive = false;
 
-        // Hard cap: never compact in a loop.
+        // Hard cap: never compact in a loop. The cap bounds pi-vigilant's OWN
+        // recovery. When the compaction fallback is enabled it is the last
+        // resort and carries its own attempt budget, so latching the block here
+        // would dead-end the session — the one outcome the fallback exists to
+        // prevent. Case 3a (context overflow) already honours this; this branch
+        // used to latch unconditionally, so a starved-length stop (tiny output,
+        // window nearly full) that reached the cap left agent_settled unable to
+        // retry the compaction, and the session stayed stuck printing the same
+        // two give-up messages every turn.
         if (
           state.contextPressureCompactionsQueued >=
           config.maxContextPressureCompactions
         ) {
-          state.overflowRetryBlocked = true;
-          ctx.ui.notify(
-            "Context remains exhausted after automatic compaction. Stopping automatic continuations; start a new session or select a larger-context model.",
-            "warning",
-          );
+          if (!config.compactionFallback) {
+            state.overflowRetryBlocked = true;
+            ctx.ui.notify(
+              "Context remains exhausted after automatic compaction. Stopping automatic continuations; start a new session or select a larger-context model.",
+              "warning",
+            );
+          }
           return;
         }
 

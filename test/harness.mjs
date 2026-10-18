@@ -47,6 +47,67 @@ export async function loadExtension(extPath, { agentDir } = {}) {
   const notifications = [];
   let failNextCompact = false;
 
+  /**
+   * A faithful `preparation`/`branchEntries` pair for the compact the mock
+   * emits. The real host's AgentSession.compact() calls prepareCompaction()
+   * and THROWS before emitting if it returns null, so `session_before_compact`
+   * always carries a preparation with messagesToSummarize/firstKeptEntryId/
+   * tokensBefore plus the branch entries. A mock that omits them makes the
+   * compaction fallback throw `Cannot read properties of undefined (reading
+   * 'messagesToSummarize')` the moment it is reached through ctx.compact() —
+   * so every fallback assertion routed through that path was really exercising
+   * the catch branch and passing vacuously. Tests may replace the span with
+   * setCompactSpan() when they need specific sizes or cut points.
+   */
+  const CHARS_PER_TOKEN = 4;
+  const spanMessageEntry = (id, role, tokens) => ({
+    type: "message",
+    id,
+    message: {
+      role,
+      content: [{ type: "text", text: "x".repeat(tokens * CHARS_PER_TOKEN) }],
+      timestamp: 1,
+    },
+  });
+  const defaultSpan = () => {
+    const entries = [];
+    for (let i = 0; i < 4; i++) {
+      entries.push(spanMessageEntry(`m${i}`, i % 2 === 0 ? "user" : "assistant", 1024));
+    }
+    entries.push(spanMessageEntry("k0", "assistant", 128));
+    entries.push(spanMessageEntry("k1", "assistant", 128));
+    return entries;
+  };
+  let compactSpan = null;
+  const compactEvent = (opts) => {
+    const entries = compactSpan ?? defaultSpan();
+    const firstKeptEntryId =
+      entries.find((e) => e.id.startsWith("k"))?.id ?? entries[entries.length - 1].id;
+    const cutIndex = Math.max(0, entries.findIndex((e) => e.id === firstKeptEntryId));
+    const messagesToSummarize = entries
+      .slice(0, cutIndex)
+      .filter((e) => e.type !== "compaction")
+      .map((e) => (e.type === "message" ? e.message : undefined))
+      .filter(Boolean);
+    return {
+      type: "session_before_compact",
+      reason: "overflow",
+      willRetry: false,
+      customInstructions: opts?.customInstructions,
+      signal: { aborted: false },
+      preparation: {
+        firstKeptEntryId,
+        messagesToSummarize,
+        turnPrefixMessages: [],
+        isSplitTurn: false,
+        tokensBefore: messagesToSummarize.length * 1024 || 4096,
+        fileOps: {},
+        settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+      },
+      branchEntries: entries,
+    };
+  };
+
   // Session-side queue simulation (mirrors agent-session pendingMessageCount)
   const queue = { steering: [], followUp: [] };
 
@@ -114,32 +175,14 @@ export async function loadExtension(extPath, { agentDir } = {}) {
         failNextCompact = false;
         pendingCompacts.push(
           (async () => {
-            await emit(
-              {
-                type: "session_before_compact",
-                reason: "overflow",
-                willRetry: false,
-                customInstructions: opts?.customInstructions,
-                signal: { aborted: false },
-              },
-              {},
-            );
+            await emit(compactEvent(opts), {});
             opts?.onError?.(new Error("compaction failed"));
           })(),
         );
       } else {
         pendingCompacts.push(
           (async () => {
-            await emit(
-              {
-                type: "session_before_compact",
-                reason: "overflow",
-                willRetry: false,
-                customInstructions: opts?.customInstructions,
-                signal: { aborted: false },
-              },
-              {},
-            );
+            await emit(compactEvent(opts), {});
             await emit(
               {
                 type: "session_compact",
@@ -183,6 +226,13 @@ export async function loadExtension(extPath, { agentDir } = {}) {
     /** Make the next ctx.compact() fire onError instead of onComplete. */
     failNextCompact() {
       failNextCompact = true;
+    },
+    /**
+     * Replace the span the mock's session_before_compact reports, so a test can
+     * drive the fallback with specific sizes, cut points or illegal cut points.
+     */
+    setCompactSpan(entries) {
+      compactSpan = entries;
     },
   };
 }

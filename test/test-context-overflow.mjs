@@ -415,6 +415,90 @@ section("7 — length path regression: Case 1a still compacts on starved stops")
 }
 
 // ---------------------------------------------------------------------------
+section("7b — the Case 1a cap must NOT block the last-resort fallback");
+// ---------------------------------------------------------------------------
+{
+  // The production signature this guards: the provider rejects the request
+  // because the prompt already fills the window and only ~1 output token fits
+  // ("requested 1 output tokens and your prompt contains at least 168000 input
+  // tokens"). That is a starved-length stop, so it lands in Case 1a — NOT in
+  // Case 3a, which §5 covers. Case 1a used to latch overflowRetryBlocked the
+  // moment its compaction cap was reached, and the latch is cleared only by a
+  // successful compaction — which could no longer happen. agent_settled was
+  // therefore permanently unable to retry the compaction, the fallback never
+  // ran, and the session printed the same two give-up messages every turn.
+  const ext = extWithConfig({
+    maxContextPressureCompactions: 1,
+    maxCompactionFallbackAttempts: 3,
+  });
+  const { emit, sent, queue, compacted, notifications, pendingCompacts } = await loadExtension(ext);
+  const llm = [{ role: "user", content: "Fix the auth bug.", timestamp: 1 }];
+  const ctx = { model: { contextWindow: 168000 } };
+  const starved = () =>
+    assistantMsg({
+      stopReason: "length",
+      text: null,
+      usage: { input: 168000, output: 1, cacheRead: 0, cacheWrite: 0 },
+    });
+  const drain = async () => {
+    if (pendingCompacts.length) await Promise.all(pendingCompacts.splice(0));
+  };
+
+  // Episode 1 — the starved stop compacts.
+  await startRun(emit, queue, llm, ctx);
+  await emit({ type: "agent_end", messages: [starved()] }, ctx);
+  await drain();
+  check("starved stop compacts", compacted.length === 1, `${compacted.length}`);
+
+  // Episode 2 — the cap is reached. pi-vigilant's own recovery stops here, but
+  // it must not take the last resort down with it.
+  await startRun(emit, queue, llm, ctx);
+  await emit({ type: "agent_end", messages: [starved()] }, ctx);
+  await drain();
+  check(
+    "the cap holds — no second self-initiated compaction",
+    compacted.length === 1,
+    `${compacted.length}`,
+  );
+
+  // The host's own overflow recovery fails (its whole-span summary hits the
+  // token cap). An overflow failure arms the fallback immediately.
+  await emit(
+    {
+      type: "session_compact_failed",
+      reason: "overflow",
+      aborted: false,
+      errorMessage: "Summarization failed: generation hit the token cap and the summary is incomplete",
+      willRetry: false,
+      fromExtension: false,
+    },
+    ctx,
+  );
+  check(
+    "the fallback arms",
+    notifications.some((n) => /summarize the context itself/.test(n.message)),
+  );
+
+  // The turn settles. This is where the session is either recovered or lost.
+  await settleWithRetry(emit, ctx);
+  await drain();
+  check(
+    "the last-resort retry compact runs despite the cap",
+    compacted.length === 2,
+    `${compacted.length}`,
+  );
+  check(
+    "the interrupted turn resumes",
+    sent.filter((s) => s.msg.customType === "auto-continue-error").length === 1,
+    `${sent.filter((s) => s.msg.customType === "auto-continue-error").length}`,
+  );
+  check(
+    "the operator is not told to start a new session while recovery remains",
+    !notifications.some((n) => /Context remains exhausted/.test(n.message)),
+  );
+}
+
+// ---------------------------------------------------------------------------
 section("8 — overflow error with contextPressureCompaction disabled falls back to continuation");
 // ---------------------------------------------------------------------------
 {

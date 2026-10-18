@@ -2,10 +2,9 @@
 
 All notable changes to pi-vigilant are documented here.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
 ## [Unreleased]
+
+## [0.8.0] - 2026-10-18
 
 ### Added
 
@@ -28,6 +27,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applicability, integration with the spec tree, sibling-extension and drop-in
   discovery, and the rule that an obligation nobody declared is not silently
   treated as satisfied.
+
+### Fixed
+
+- **A starved-length stop that reached the compaction cap dead-locked the session
+  permanently.** Reported from production: a session stuck on
+
+  ```
+  400: This model's maximum context length is 168000 tokens. However, you requested
+  1 output tokens and your prompt contains at least 168000 input tokens ...
+  Context overflow recovery failed: Summarization failed: generation hit the token
+  cap and the summary is incomplete
+  Truncated response recovery failed after one compact-and-retry attempt.
+  ```
+
+  ...repeating every turn, with the fallback never running.
+
+  **Root cause.** Two branches handle an exhausted context, and they disagreed.
+  Case 3a (a provider overflow *error*) had been fixed earlier to stop latching
+  `overflowRetryBlocked` once the compaction fallback was enabled. Case 1a — a
+  **length stop** that emitted almost nothing (`stopReason: "length"`, tiny output,
+  window nearly full) — still latched it **unconditionally** the moment its
+  `maxContextPressureCompactions` cap was reached. The latch is cleared only by a
+  successful compaction, which could no longer happen, so `agent_settled` was
+  permanently barred from retrying the compaction and the last-resort fallback could
+  never run. The session had no route out except a manual `/compact`.
+
+  The trigger was a length stop, not an overflow error: pi's own message reads
+  "**Truncated** response recovery failed", the wording it uses when
+  `contextOverflow` is false. Case 1a is reachable on every default install
+  (`contextPressureCompaction` defaults to `true`).
+
+  **Fix.** Case 1a now honours the rule Case 3a already followed — the cap bounds
+  *pi-vigilant's own* recovery and must never block the last resort, which carries
+  its own `maxCompactionFallbackAttempts` budget. The "start a new session" warning
+  is suppressed in the same branch, because telling the operator to give up while
+  recovery is still available is wrong; it still fires when the fallback is disabled.
+
+- **The test harness was hiding this class of bug.** `test/harness.mjs` emitted
+  `session_before_compact` from the `ctx.compact()` mock **without** `preparation`
+  or `branchEntries`. The real host always supplies them (`prepareCompaction()`
+  throws before emitting if it returns null), so the fallback threw
+  `Cannot read properties of undefined (reading 'messagesToSummarize')` the moment it
+  was reached through that path — every fallback assertion routed through
+  `ctx.compact()` was really exercising the catch branch and passing vacuously. The
+  mock now builds a faithful span, with `setCompactSpan()` for tests that need
+  specific sizes or cut points.
+
+### Tests
+
+- `test-context-overflow.mjs` §7b drives the **starved-length** path to the cap and
+  asserts the last-resort retry compact still runs, the interrupted turn resumes,
+  and the give-up message stays suppressed. Verified as a genuine guard: with the
+  fix reverted, exactly those three checks fail (38/41); with it, 41/41.
+- `test-length-loop.mjs` §6.11 now covers **both** configurations instead of one —
+  cap + fallback on (no give-up message) and cap + fallback off (give-up message
+  shown) — so the suppressed message cannot silently regress either way.
+- Full suite green; `npm run check` OK.
+
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.7.2] - 2026-10-14
 
