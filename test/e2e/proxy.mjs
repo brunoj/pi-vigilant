@@ -43,7 +43,23 @@ const TOOL_ARGS = process.env.E2E_TOOL_ARGS || '{"path":"README.md"}';
 
 writeFileSync(LOG, "");
 
+// A summary with real weight. A 37-character stub made "the context strictly shrank"
+// pass no matter what the fallback did — the post-compaction context is ~0 tokens
+// against any tokensBefore, so the assertion had no teeth. Size is configurable so a
+// scenario can make the summary big enough to matter.
+function summaryText(label) {
+  const chars = Number(process.env.E2E_SUMMARY_CHARS || 4000);
+  const unit = "E2E_SUMMARY " + label + " covering the summarized span with representative content. ";
+  let s = "";
+  while (s.length < chars) s += unit;
+  return s.slice(0, chars);
+}
+
 let turns = 0;
+// Agent turns only (summaries excluded): a scripted sequence must not have its
+// tool-call slots consumed by summarization requests, or a scenario silently runs
+// fewer steps than it asserts (this happened and made the TTL one-shot check vacuous).
+let agentTurns = 0;
 
 function log(entry) {
   appendFileSync(LOG, JSON.stringify(entry) + "\n");
@@ -118,6 +134,7 @@ const server = createServer((req, res) => {
     };
     log(entry);
     turns += 1;
+    if (!entry.summary) agentTurns += 1;
 
     if (turns > MAX_REQUESTS) {
       sse(res, [{ role: "assistant" }, { content: "E2E_MAX_REQUESTS reached" }], "stop",
@@ -136,7 +153,7 @@ const server = createServer((req, res) => {
         return;
       }
       if (entry.summary) {
-        sse(res, [{ role: "assistant" }, { content: `E2E_SUMMARY slice ${turns} covering the span` }], "stop", usageFor(entry.bytes));
+        sse(res, [{ role: "assistant" }, { content: summaryText(`slice ${turns}`) }], "stop", usageFor(entry.bytes));
         return;
       }
       // Build the context the way a real session does — many medium tool results,
@@ -179,11 +196,42 @@ const server = createServer((req, res) => {
         return;
       }
       if (entry.summary) {
-        sse(res, [{ role: "assistant" }, { content: `E2E_SUMMARY slice ${turns} covering the span` }], "stop",
+        sse(res, [{ role: "assistant" }, { content: summaryText(`slice ${turns}`) }], "stop",
           usageFor(entry.bytes));
         return;
       }
       sse(res, [{ role: "assistant" }, { content: "E2E_OK" }], "stop", usageFor(entry.bytes));
+      return;
+    }
+
+    if (MODE === "hang") {
+      // Drives the tool-call timeout ceiling. pi-vigilant does not kill the tool
+      // itself — it caps `input.timeout` on the shell tool call and pi's own bash
+      // enforces it, so the observable evidence is the tool RESULT (aborted vs
+      // completed) plus wall-clock, not a message from us.
+      if (!entry.summary) {
+        if (agentTurns === 1 && process.env.E2E_TTL_SECONDS) {
+          sse(res, toolCallChunks("call_ttl", "set_next_tool_timeout",
+            `{"seconds":${process.env.E2E_TTL_SECONDS}}`), "tool_calls", usageFor(entry.bytes));
+          return;
+        }
+        // Explicit slots: the TTL call occupies agent turn 1 when asked for, so the
+        // hangs start after it. Deriving this from a single count silently dropped the
+        // second hang (and made the one-shot assertion vacuous) — caught by the
+        // enforcement-off control, which is exactly what controls are for.
+        const firstHang = process.env.E2E_TTL_SECONDS ? 2 : 1;
+        const hangCount = Number(process.env.E2E_SECOND_HANG || 0) ? 2 : 1;
+        if (agentTurns >= firstHang && agentTurns < firstHang + hangCount) {
+          const arg = process.env.E2E_REQUESTED_TIMEOUT
+            ? `{"command":"sleep ${process.env.E2E_SLEEP || 12}","timeout":${process.env.E2E_REQUESTED_TIMEOUT}}`
+            : `{"command":"sleep ${process.env.E2E_SLEEP || 12}"}`;
+          sse(res, toolCallChunks(`call_hang_${agentTurns}`, "bash", arg), "tool_calls", usageFor(entry.bytes));
+          return;
+        }
+        sse(res, [{ role: "assistant" }, { content: "E2E_OK hang done" }], "stop", usageFor(entry.bytes));
+        return;
+      }
+      sse(res, [{ role: "assistant" }, { content: "E2E_SUMMARY hang" }], "stop", usageFor(entry.bytes));
       return;
     }
 

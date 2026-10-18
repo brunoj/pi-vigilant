@@ -51,6 +51,9 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want '$3', got '$2')";
 if [ -n "${E2E_GUARD_CONFIG:-}" ]; then GUARD_ON="$E2E_GUARD_CONFIG"; else
 GUARD_ON='{"loopGuardian":true,"loopCooldownMs":0,"prematureStopDetection":false,"lengthStopContinuation":false,"compactionContinuation":false,"finalVerification":false,"completenessGuard":false}'
 fi
+if [ -n "${E2E_TIMEOUT_CONFIG:-}" ]; then TIMEOUT_CFG="$E2E_TIMEOUT_CONFIG"; else
+TIMEOUT_CFG='{"loopGuardian":false,"prematureStopDetection":false,"lengthStopContinuation":false,"compactionContinuation":false,"finalVerification":false,"completenessGuard":false,"toolTimeoutEnforcement":true,"toolTimeoutCeilingSeconds":3}'
+fi
 if [ -n "${E2E_COMPACT_CONFIG:-}" ]; then COMPACT_CFG="$E2E_COMPACT_CONFIG"; else
 COMPACT_CFG='{"loopGuardian":false,"prematureStopDetection":false,"lengthStopContinuation":false,"compactionContinuation":true,"finalVerification":false,"completenessGuard":false,"compactionFallback":true,"compactionFallbackAfterFailures":2,"maxCompactionFallbackAttempts":5,"compactionFallbackChunkTokens":800,"maxCompactionFallbackChunks":40}'
 fi
@@ -113,12 +116,26 @@ EOF
     node "$HERE/e2e/make-session.mjs" "$RUN/sessions/s.jsonl" "$E2E_SESSION_TURNS" "${E2E_SESSION_SIZE:-1500}" > /dev/null
     sess=(--session "$RUN/sessions/s.jsonl")
   fi
+  local t0=$SECONDS
   ( cd "$RUN/work" && PI_CODING_AGENT_DIR="$RUN/agent" timeout "${E2E_TIMEOUT:-120}" \
       "$PI_BIN" --print "${sess[@]}" "${spy[@]}" -e "$EXT" --model e2e/e2e-model "$prompt" > "$RUN/pi.out" 2>&1 )
-  echo "  pi exit=$?  requests=$(wc -l < "$E2E_LOG" 2>/dev/null || echo 0)"
+  local rc=$?
+  echo "  pi exit=$rc  elapsed=$((SECONDS-t0))s  requests=$(wc -l < "$E2E_LOG" 2>/dev/null || echo 0)"
+  E2E_ELAPSED=$((SECONDS-t0))
 }
 
 journal() { grep -c "$1" "$E2E_LOG" 2>/dev/null || true; }
+# Search TOOL RESULTS only. Grepping the whole journal matches the system prompt,
+# whose bash tool description literally contains the word "timeout" — that made an
+# earlier abort assertion pass even with enforcement off.
+toolresults() { python3 -c "
+import json,re
+pat=re.compile('$1', re.I)
+n=0
+for l in open('$E2E_LOG'):
+    for m in (json.loads(l).get('tail') or []):
+        if m.get('role')=='tool' and pat.search(str(m.get('content') or '')): n+=1
+print(n)" 2>/dev/null || echo 0; }
 # The CompactionEntry we hand back is written into the session by the host, and it
 # carries our `details` — so the mechanism that actually produced the compaction is
 # readable from the artifact, not inferred from request shapes.
@@ -202,6 +219,15 @@ import json
 ls=[json.loads(l) for l in open('$E2E_LOG')]
 print(sum(1 for d in ls if not d['summary'] and 'E2E_SUMMARY' in json.dumps(d.get('tail') or [])))" 2>/dev/null || echo 0)
     [ "$carried" -ge 1 ] && ok "the fallback's summary reached an agent turn — the host honoured the compaction" || echo "  NOTE  no agent turn carried the summary here; the resume path is asserted by the 'resume' scenario"
+    # The two clauses that only exist in the artifact the host wrote — no stacking,
+    # and a fit against the model's real prompt limit — are asserted by a separate
+    # checker rather than inline python, so they stay readable and testable.
+    while IFS= read -r line; do
+      case "$line" in
+        PASS\ *) ok "${line#PASS }" ;;
+        *)       bad "${line#FAIL }" ;;
+      esac
+    done < <(node "$HERE/e2e/fit-check.mjs" "$RUN/sessions/s.jsonl" 2>&1)
     [ "$(journal 'could not summarize the context')" -eq 0 ] && ok "the dead-end message never appeared" || bad "the session hit the dead-end message"
     ;;
 esac
@@ -266,6 +292,40 @@ print(sum(1 for d in ls if d['summary'] and d['bytes']<=int('$E2E_FAIL_ABOVE')))
     m=$(mech); [ "${m%% *}" = "prefix-cut" ] && ok "only Mechanism B could complete, and it did ($m)" || bad "expected mechanism prefix-cut when the fold budget binds, got '${m:-none}'"
     grep -q '"fromExtension":true' "$RUN/spy.jsonl" 2>/dev/null && ok "a partial compaction was still returned and adopted — the round made progress" || bad "no compaction adopted when the fold could not complete"
     [ "$(journal 'could not summarize the context')" -eq 0 ] && ok "the dead-end message never appeared" || bad "the session hit the dead-end message"
+    ;;
+esac
+
+case "${1:-all}" in
+  all|tool-timeout)
+    # The 30-minute ceiling, made observable by shrinking it: a shell call that
+    # would hang for 12s must be cut at the 3s ceiling. pi-vigilant caps the
+    # timeout it writes onto the tool call; pi's own bash enforces it, so the
+    # evidence is wall-clock plus the tool result the model receives.
+    stage_ext "$STAGE/timeout" "$TIMEOUT_CFG"
+    EXT="$STAGE/timeout/index.ts"
+    export E2E_CTX=168000 E2E_MAX_TOKENS=4096 E2E_MAX_REQUESTS=20 E2E_TIMEOUT=90
+    export E2E_SLEEP=12
+    run_scenario "tool-timeout" hang "hang on a shell command"
+    [ "$E2E_ELAPSED" -lt 12 ] && ok "the 12s hang was cut short by the 3s ceiling (run took ${E2E_ELAPSED}s)" || bad "the hang ran to completion (${E2E_ELAPSED}s) — the ceiling did not fire"
+    [ "$(toolresults 'timed out|timed-out|timeout|exceeded|killed')" -ge 1 ] && ok "the model was told the call was aborted" || bad "no abort surfaced to the model in any tool result"
+    grep -q "E2E_OK hang done" "$RUN/pi.out" 2>/dev/null && ok "the session carried on after the aborted call" || bad "the session died with the aborted tool call"
+    ;;
+esac
+
+case "${1:-all}" in
+  all|ttl)
+    # set_next_tool_timeout must raise the ceiling for the NEXT call only. One
+    # scenario proves both halves: the TTL'd call survives a sleep longer than the
+    # ceiling, and the very next call — with no TTL — is cut again. That is what
+    # one-shot means, and it is the half a unit test of the tool alone cannot show.
+    stage_ext "$STAGE/ttl" "$TIMEOUT_CFG"
+    EXT="$STAGE/ttl/index.ts"
+    export E2E_CTX=168000 E2E_MAX_TOKENS=4096 E2E_MAX_REQUESTS=20 E2E_TIMEOUT=120
+    export E2E_SLEEP=12 E2E_TTL_SECONDS=60 E2E_SECOND_HANG=1
+    run_scenario "ttl" hang "hang on a shell command, twice"
+    [ "$E2E_ELAPSED" -ge 12 ] && ok "the TTL'd call was allowed to run past the 3s ceiling (run took ${E2E_ELAPSED}s)" || bad "the TTL did not raise the ceiling — the first hang was cut at ${E2E_ELAPSED}s"
+    [ "$E2E_ELAPSED" -lt 24 ] && ok "the very next call reverted to the ceiling — the TTL was one-shot, not sticky (${E2E_ELAPSED}s for 12s + 3s)" || bad "both hangs ran full length (${E2E_ELAPSED}s) — the TTL persisted"
+    grep -q "E2E_OK hang done" "$RUN/pi.out" 2>/dev/null && ok "the session completed" || bad "the session never completed"
     ;;
 esac
 
