@@ -4,6 +4,13 @@ All notable changes to pi-vigilant are documented here.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-04
+
+### Added
+
+- (describe changes for 0.8.2)
+
+
 ## [0.8.1] - 2026-10-18
 
 ### Added
