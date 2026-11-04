@@ -36,7 +36,18 @@ done
 
 missing=()
 for p in "${PEERS[@]}"; do
-  [ -f "$TOOLS/node_modules/$p/package.json" ] || missing+=("$p@${WANT[$p]}")
+  if [ -f "$TOOLS/node_modules/$p/package.json" ]; then
+    # A cached peer at the wrong version is worse than a missing one: the gate
+    # would typecheck against host APIs the declared version no longer has
+    # (pi-ai dropped its TypeBox re-export between 1.2 and 1.5, for example),
+    # and still print OK. Compare what is installed with what is declared.
+    have=$(node -p "require('$TOOLS/node_modules/$p/package.json').version" 2>/dev/null)
+    want=${WANT[$p]#^}
+    want=${want#~}
+    [ "$have" = "$want" ] || missing+=("$p@${WANT[$p]}")
+  else
+    missing+=("$p@${WANT[$p]}")
+  fi
 done
 [ -d "$TOOLS/node_modules/@types/node" ] || missing+=("@types/node@22")
 
