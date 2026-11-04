@@ -6,9 +6,22 @@ All notable changes to pi-vigilant are documented here.
 
 ## [0.8.2] - 2026-11-04
 
-### Added
+### Changed
 
-- (describe changes for 0.8.2)
+- The pi peers are pinned to 1.5.0, the version that actually loads this extension. Its
+  tool-argument validation moved to `@earendil-works/pi-schema`; audited against that — no
+  tool schema uses a TypeBox-only feature (`Type.Refine`, `BigInt`, `Undefined`, codecs,
+  `Format.Set`), and `StringEnum` emits plain JSON Schema (`{type:"string",enum:[...]}`),
+  so enum enforcement survives. Verified by running the real tool schemas through pi's own
+  validator.
+- `jiti` is declared as a devDependency; the harness imported it without declaring it.
+
+### Fixed
+
+- The typecheck gate no longer reuses a cached peer at the wrong version: it printed
+  `host types 1.2.0` against a manifest declaring 1.5.0 and still reported OK.
+- `scripts/verify-published.mjs` polls for the tarball instead of trusting one HEAD
+  request, which 404s transiently while a fresh release sits in npm's staging queue.
 
 
 ## [0.8.1] - 2026-10-18

@@ -54,13 +54,26 @@ check(`${VERSION} is the latest dist-tag`, doc?.["dist-tags"]?.latest === VERSIO
 let tarballOk = false;
 let tarballDetail = "no tarball url";
 if (entry?.dist?.tarball) {
-  try {
-    const h = await fetch(entry.dist.tarball, { method: "HEAD" });
-    tarballOk = h.ok;
-    tarballDetail = `HTTP ${h.status}`;
-  } catch (e) {
-    tarballDetail = e.message;
+  // npm publishes the packument before the CDN serves the bytes: a single HEAD
+  // taken right after publish can 404 for a minute while the release sits in
+  // the staging queue. Poll with a deadline — a gate that fails on a transient
+  // teaches people to ignore the gate.
+  const startedAt = Date.now();
+  const deadline = startedAt + 120_000;
+  let attempt = 0;
+  for (;;) {
+    attempt++;
+    try {
+      const h = await fetch(entry.dist.tarball, { method: "HEAD", cache: "no-store" });
+      tarballOk = h.ok;
+      tarballDetail = `HTTP ${h.status}`;
+    } catch (e) {
+      tarballDetail = e.message;
+    }
+    if (tarballOk || Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, Math.min(15_000, 3_000 * attempt)));
   }
+  if (attempt > 1) console.log(`  (tarball became fetchable after ${attempt} attempts, ${Math.round((Date.now() - startedAt) / 1000)}s)`);
 }
 // Metadata listing a version is not enough — an install needs the bytes. This is
 // the gate that caught pi-vigilant 0.8.0 printing "Released" while `npm install`
