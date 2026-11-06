@@ -4,6 +4,20 @@ All notable changes to pi-vigilant are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Spec memory and feedback memory are keyed by the git work-tree root** (the
+  absolute path outside git), not the cwd basename. Before this, `cd` into a
+  subdirectory opened a new, empty store, so the project's specs and feedback
+  disappeared mid-task. Two checkouts with the same folder name (`~/work/api`,
+  `~/other/api`) also shared one store, so one project's met specs leaked into the
+  other. The key is a published contract: `test/test-project-key.mjs` pins its
+  input-to-key vectors, and the consuming extension pins the same ones.
+- Data under the old basename key is **copied** (never moved) to the new key on
+  first use and the copy is recorded in `.migrated-from`. The upgrade loses
+  nothing, and same-named checkouts that used to share a store each keep what they
+  saw. A later call never copies again over newer data.
+
 ## [0.8.2] - 2026-11-04
 
 ### Changed

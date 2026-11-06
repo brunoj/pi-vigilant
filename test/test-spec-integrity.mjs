@@ -21,6 +21,10 @@ import os from "node:os";
 import path from "node:path";
 
 const EXT = new URL("../index.ts", import.meta.url).pathname;
+// The store key comes from the real module (lib/project.ts), not a re-implementation.
+import { createJiti } from "jiti";
+const { projectKey: storeKeyOf } = await createJiti(import.meta.url).import(new URL("../lib/project.ts", import.meta.url).pathname);
+const storeKey = (root) => storeKeyOf(root);
 const results = [];
 const check = (name, cond, detail = "") => {
   results.push({ name, cond });
@@ -38,7 +42,7 @@ process.chdir(projectDir);
 
 const taskFile = path.join(
   process.env.PI_CODING_AGENT_DIR,
-  "skills", "spec-memory", "projects", path.basename(projectDir), "current-task.json",
+  "skills", "spec-memory", "projects", storeKey(fs.realpathSync(projectDir)), "current-task.json",
 );
 
 const { tools } = await loadExtension(EXT);

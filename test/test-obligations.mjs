@@ -20,6 +20,7 @@ import { createJiti } from "jiti";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+const { projectKey } = await createJiti(import.meta.url).import(new URL("../lib/project.ts", import.meta.url).pathname);
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const REPO = path.join(HERE, "..");
@@ -347,7 +348,7 @@ async function driveExtension() {
 
     const taskFile = path.join(
       agentDir, "skills", "spec-memory", "projects",
-      path.basename(projectDir), "current-task.json",
+      projectKey(fs.realpathSync(projectDir)), "current-task.json",
     );
     return {
       treeText,

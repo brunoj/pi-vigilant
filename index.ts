@@ -62,6 +62,7 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { LoopGuardian, type LoopGuardianConfig } from "./lib/loop-guardian.js";
 import { auditCompleteness, currentRevision, type CompletenessAudit } from "./lib/completeness.js";
+import { projectKey, projectStoreDir } from "./lib/project.js";
 import {
   loadObligations,
   applicableObligations,
@@ -624,17 +625,15 @@ function getSpecDir(): string {
   return path.join(getAgentDir(), "skills", "spec-memory");
 }
 
+// Keyed by the git work-tree root (absolute cwd outside git), not the cwd
+// basename — see lib/project.ts. Other extensions reading the spec store use the same key.
 function getCurrentTaskFile(): string {
-  const projectName = path.basename(process.cwd());
-  return path.join(getSpecDir(), "projects", projectName, "current-task.json");
+  return path.join(projectStoreDir(getSpecDir()), "current-task.json");
 }
 
 function getArchivedTaskFile(taskId: string): string {
-  const projectName = path.basename(process.cwd());
   return path.join(
-    getSpecDir(),
-    "projects",
-    projectName,
+    projectStoreDir(getSpecDir()),
     "archived",
     `${taskId}.json`,
   );
@@ -940,8 +939,7 @@ function getGlobalFile(): string {
 }
 
 function getProjectFile(): string {
-  const projectName = path.basename(process.cwd());
-  return path.join(getFeedbackDir(), "projects", projectName, "feedback.json");
+  return path.join(projectStoreDir(getFeedbackDir()), "feedback.json");
 }
 
 function ensureDir(dir: string): void {
@@ -1072,7 +1070,7 @@ function compileFeedback(
  * Get compiled checkpoints for the current project + global.
  */
 function getFeedbackCheckpoints(): string {
-  const projectName = path.basename(process.cwd());
+  const projectName = path.basename(process.cwd()); // display label only; storage uses projectKey()
   const globalItems = loadUnresolvedItems(getGlobalFile());
   const projectItems = loadUnresolvedItems(getProjectFile());
   return compileFeedback(projectItems, globalItems, projectName);
@@ -1692,7 +1690,7 @@ export default function (pi: ExtensionAPI): void {
         timestamp,
         scope: params.scope,
         project:
-          params.scope === "project" ? path.basename(process.cwd()) : undefined,
+          params.scope === "project" ? projectKey() : undefined,
         category: params.category,
         specific_behavior: params.specific_behavior,
         expected_behavior: params.expected_behavior,
