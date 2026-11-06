@@ -4,6 +4,13 @@ All notable changes to pi-vigilant are documented here.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-06
+
+### Added
+
+- (describe changes for 0.9.0)
+
+
 ### Changed
 
 - **Spec memory and feedback memory are keyed by the git work-tree root** (the
